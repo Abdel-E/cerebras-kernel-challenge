@@ -1,0 +1,8 @@
+// PE-local program for the Top-K challenge.
+//
+// TODO:
+// - receive or load the local shard of D
+// - receive the broadcast query q
+// - compute local squared L2 distances
+// - maintain a deterministic local top-K
+// - participate in the global merge/reduction

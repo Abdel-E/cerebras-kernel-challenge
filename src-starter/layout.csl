@@ -1,0 +1,14 @@
+// Top-level layout entrypoint for the challenge submission.
+//
+// Required grader parameters:
+//   P
+//   d_dim
+//   rows_per_pe
+//   K
+//
+// Start by adapting patterns from:
+// - examples/tutorials/gemv-05-multiple-pes
+// - examples/tutorials/topic-11-collectives
+// - examples/benchmarks/gemv-collectives_2d
+
+// TODO: define the PE grid, memcpy endpoints, and routing/collectives.
