@@ -1,3 +1,5 @@
+**Challenge start time:** 9:38 PM EST, April 28, 2026
+
 # Cerebras Kernel Challenge — Top-K k-NN
 
 ## What you're building
