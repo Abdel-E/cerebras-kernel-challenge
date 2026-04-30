@@ -1,0 +1,27 @@
+out/
+out_*/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+SETUP.md
+examples/
+docker/
+tests/
+reference.py
+SPEC.md
+cycles.json
+CSL_LEARNING_GUIDE.md
+.devcontainer/
+.vscode/
+.codex
+src-starter/ARCHITECTURE_NOTEBOOK.md
+src-starter/SELF_QUIZ.md
+csl.vscode/
+*.vsix
+
+# Simulator artifacts (generated)
+src-starter/sim.log
+src-starter/sim_stats.json
+src-starter/simconfig.json
+src-starter/simfab_traces/

@@ -21,3 +21,16 @@ Common pitfalls (not a full list, just the ones we've seen):
   default is the deprecated CSELFRunner and will reject your compile.
 - **Collective callbacks fire on every PE in the group**, not just the
   destination. Structure your task state machine accordingly.
+
+## Learning-first workflow
+
+Before implementing the kernel, use the repo-level `CSL_LEARNING_GUIDE.md` and
+this directory's `ARCHITECTURE_NOTEBOOK.md` / `SELF_QUIZ.md`.
+
+The intended flow is:
+
+1. Read one tutorial block.
+2. Add notes to `ARCHITECTURE_NOTEBOOK.md`.
+3. Use `SELF_QUIZ.md` to check whether you can explain the concept.
+4. Only after the architecture is clear, compress the notebook into
+   `DESIGN.md` and start implementation.

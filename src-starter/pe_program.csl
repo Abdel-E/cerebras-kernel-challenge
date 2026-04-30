@@ -68,17 +68,17 @@ const mpi_x = @import_module("<collectives_2d/pe>", .{ .dim_params = c2d_params.
 const mpi_y = @import_module("<collectives_2d/pe>", .{ .dim_params = c2d_params.y });
 
 const D_LEN: u16 = rows_per_pe * d_dim;
+const rows_per_pe_i16: i16 = @as(i16, rows_per_pe);
+const d_dim_i16: i16 = @as(i16, d_dim);
 const INF: f32 = 1.0e30;
 const SENTINEL_INDEX: u32 = 2147483647;
 const dummy = @zeros([1]f32);
-
-var mem_x_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> dummy[i] });
-var mem_y_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> dummy[i] });
 
 var D = @zeros([D_LEN]f32);
 var D_norms = @zeros([rows_per_pe]f32);
 var q = @zeros([d_dim]f32);
 var valid_count = @zeros([1]u32);
+var distance_scratch = @zeros([rows_per_pe]f32);
 var local_distances = @zeros([K]f32);
 var local_indices = @zeros([K]u32);
 var row_distances = @zeros([P * K]f32);
@@ -98,6 +98,12 @@ var ptr_q: [*]f32 = &q;
 var ptr_valid_count: [*]u32 = &valid_count;
 const ptr_final_distances: [*]f32 = &final_distances;
 const ptr_final_indices: [*]u32 = &final_indices;
+
+var mem_x_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> dummy[i] });
+var mem_y_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> dummy[i] });
+var D_col_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{rows_per_pe_i16} -> D[i * d_dim_i16] });
+var norms_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &D_norms, .extent = rows_per_pe });
+var dist_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &distance_scratch, .extent = rows_per_pe });
 
 var px: u16;
 var py: u16;
@@ -287,6 +293,48 @@ fn write_heap_sorted_to_final() void {
   }
 }
 
+fn merge_row_topk_select() void {
+  for (@range(u16, K)) |out_idx| {
+    var best_pos: u16 = 0;
+    var best_distance: f32 = INF;
+    var best_index: u32 = SENTINEL_INDEX;
+
+    for (@range(u16, P * K)) |i| {
+      if (better(row_distances[i], row_indices[i], best_distance, best_index)) {
+        best_pos = i;
+        best_distance = row_distances[i];
+        best_index = row_indices[i];
+      }
+    }
+
+    row_top_distances[out_idx] = best_distance;
+    row_top_indices[out_idx] = best_index;
+    row_distances[best_pos] = INF;
+    row_indices[best_pos] = SENTINEL_INDEX;
+  }
+}
+
+fn merge_global_topk_select() void {
+  for (@range(u16, K)) |out_idx| {
+    var best_pos: u16 = 0;
+    var best_distance: f32 = INF;
+    var best_index: u32 = SENTINEL_INDEX;
+
+    for (@range(u16, P * K)) |i| {
+      if (better(all_distances[i], all_indices[i], best_distance, best_index)) {
+        best_pos = i;
+        best_distance = all_distances[i];
+        best_index = all_indices[i];
+      }
+    }
+
+    final_distances[out_idx] = best_distance;
+    final_indices[out_idx] = best_index;
+    all_distances[best_pos] = INF;
+    all_indices[best_pos] = SENTINEL_INDEX;
+  }
+}
+
 fn reduce_dot(xval: f32, yval: f32, sum: *f32) f32 {
   return sum.* + xval * yval;
 }
@@ -302,23 +350,27 @@ fn dot(n: u16, x: [*]f32, y: [*]f32) f32 {
   return sum;
 }
 
-fn compute_distance(row: u16) f32 {
-  const row_ptr = @ptrcast([*]f32, &D[row * d_dim]);
-  const row_dot_q = dot(d_dim, row_ptr, &q);
-  return D_norms[row] - 2.0 * row_dot_q + q_norm;
+fn compute_all_distances() void {
+  @fadds(dist_dsd, norms_dsd, q_norm);
+  var col_dsd = D_col_dsd;
+  for (@range(u16, d_dim)) |j| {
+    @fmacs(dist_dsd, dist_dsd, col_dsd, -2.0 * q[j]);
+    col_dsd = @increment_dsd_offset(col_dsd, 1, f32);
+  }
 }
 
 fn compute_local_topk() void {
   init_local_topk();
   const pe_linear: u32 = @as(u32, py) * @as(u32, P) + @as(u32, px);
   q_norm = dot(d_dim, &q, &q);
+  compute_all_distances();
 
   if (K == rows_per_pe) {
     // k_large asks for every local row when K == rows_per_pe. In that case
     // sorted insertion only burns cycles; store candidates directly.
     for (@range(u16, rows_per_pe)) |row| {
       if (@as(u32, row) < valid_count[0]) {
-        local_distances[row] = compute_distance(row);
+        local_distances[row] = distance_scratch[row];
         local_indices[row] = pe_linear * @as(u32, rows_per_pe) + @as(u32, row);
       } else {
         local_distances[row] = INF;
@@ -328,7 +380,7 @@ fn compute_local_topk() void {
   } else {
     for (@range(u16, rows_per_pe)) |row| {
       if (@as(u32, row) < valid_count[0]) {
-        const distance = compute_distance(row);
+        const distance = distance_scratch[row];
         const global_index = pe_linear * @as(u32, rows_per_pe) + @as(u32, row);
         insert_local(distance, global_index);
       }
@@ -337,19 +389,27 @@ fn compute_local_topk() void {
 }
 
 fn merge_global_topk() void {
-  heap_reset();
-  for (@range(u16, P * K)) |i| {
-    heap_consider(all_distances[i], all_indices[i]);
+  if (K <= 16) {
+    merge_global_topk_select();
+  } else {
+    heap_reset();
+    for (@range(u16, P * K)) |i| {
+      heap_consider(all_distances[i], all_indices[i]);
+    }
+    write_heap_sorted_to_final();
   }
-  write_heap_sorted_to_final();
 }
 
 fn merge_row_topk() void {
-  heap_reset();
-  for (@range(u16, P * K)) |i| {
-    heap_consider(row_distances[i], row_indices[i]);
+  if (K <= 16) {
+    merge_row_topk_select();
+  } else {
+    heap_reset();
+    for (@range(u16, P * K)) |i| {
+      heap_consider(row_distances[i], row_indices[i]);
+    }
+    write_heap_sorted_to_row_top();
   }
-  write_heap_sorted_to_row_top();
 }
 
 fn main() void {
