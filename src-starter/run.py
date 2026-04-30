@@ -1,7 +1,8 @@
-"""Host-side entrypoint for the challenge submission.
+"""Compile-output runner for the distributed Top-K kNN CSL kernel.
 
-This file is intentionally scaffolded. Build it up in the same order as the CSL
-files instead of trying to complete the full runtime in one pass.
+The runner loads a deterministic reference case, packs the database rows into
+the PE layout expected by ``pe_program.csl``, launches the device program, and
+checks PE (0,0)'s final top-K output against the NumPy oracle.
 """
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -16,7 +18,7 @@ from cerebras.sdk.runtime.sdkruntimepybind import MemcpyDataType  # pylint: disa
 from cerebras.sdk.runtime.sdkruntimepybind import MemcpyOrder  # pylint: disable=no-name-in-module
 from cerebras.sdk.runtime.sdkruntimepybind import SdkRuntime  # pylint: disable=no-name-in-module
 
-from reference import ALL_CASES, topk_reference
+from reference import ALL_CASES
 
 
 CASE_KEYS = (
@@ -37,52 +39,56 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
-
-    print(f"Loading case {args.case}...", flush=True)
+def load_case(case_key: str) -> tuple[dict[str, Any], np.ndarray, np.ndarray]:
     cases = {key: maker() for key, maker in zip(CASE_KEYS, ALL_CASES)}
-    if args.case not in cases:
+    if case_key not in cases:
         valid = ", ".join(CASE_KEYS)
-        raise SystemExit(f"Unknown case '{args.case}'. Valid cases: {valid}")
+        raise SystemExit(f"Unknown case '{case_key}'. Valid cases: {valid}")
 
-    case = cases[args.case]
+    case = cases[case_key]
     D_source = np.asarray(case["D"], dtype=np.float32)
     q = np.asarray(case["q"], dtype=np.float32)
-    expected_indices, expected_distances = topk_reference(D_source, q, case["K"])
+    return case, D_source, q
 
-    print("Setting up runtime...", flush=True)
-    runner = SdkRuntime(args.name, cmaddr=args.cmaddr)
-    D_symbol = runner.get_id("D")
-    D_norms_symbol = runner.get_id("D_norms")
-    q_symbol = runner.get_id("q")
-    valid_count_symbol = runner.get_id("valid_count")
-    distances_symbol = runner.get_id("distances")
-    indices_symbol = runner.get_id("indices")
 
-    with open(Path(args.name) / "out.json", encoding="utf-8") as json_file:
+def read_compile_params(
+    name: str, case: dict[str, Any], D_source: np.ndarray
+) -> tuple[int, int, int, int]:
+    with open(Path(name) / "out.json", encoding="utf-8") as json_file:
         compile_data = json.load(json_file)
+
     P = int(compile_data["params"]["P"])
     d_dim = int(compile_data["params"]["d_dim"])
     rows_per_pe = int(compile_data["params"]["rows_per_pe"])
     K = int(compile_data["params"]["K"])
     if P != case["P"] or K != case["K"] or d_dim != D_source.shape[1]:
         raise SystemExit(
-            f"Compile params P={P}, d_dim={d_dim}, K={K} do not match case '{args.case}'"
+            f"Compile params P={P}, d_dim={d_dim}, K={K} do not match case '{case['name']}'"
         )
+    return P, d_dim, rows_per_pe, K
 
-    print("Loading and starting device program...", flush=True)
-    runner.load()
-    runner.run()
 
-    print("Packing D shards...", flush=True)
+def pack_inputs(
+    D_source: np.ndarray,
+    q: np.ndarray,
+    P: int,
+    d_dim: int,
+    rows_per_pe: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     num_pes = P * P
     N = D_source.shape[0]
-    D_norms_source = np.einsum("ij,ij->i", D_source, D_source).astype(np.float32)
+    q_norm = np.einsum("i,i->", q, q).astype(np.float32)
+    # Fold ||q||^2 into the packed row norms. This removes the repeated PE-side
+    # q dot product without increasing the query broadcast payload.
+    D_norms_source = (
+        np.einsum("ij,ij->i", D_source, D_source).astype(np.float32) + q_norm
+    )
     D_packed = np.zeros((P, P, rows_per_pe, d_dim), dtype=np.float32)
     D_norms_packed = np.zeros((P, P, rows_per_pe), dtype=np.float32)
     valid_counts = np.zeros((P, P, 1), dtype=np.uint32)
 
+    # PE linear order matches the device index formula:
+    # global_index = (py * P + px) * rows_per_pe + local_row.
     for pe_linear in range(num_pes):
         py, px = divmod(pe_linear, P)
         start = pe_linear * rows_per_pe
@@ -93,102 +99,141 @@ def main() -> int:
             D_norms_packed[py, px, :valid] = D_norms_source[start:end]
         valid_counts[py, px, 0] = valid
 
+    return D_packed, D_norms_packed, valid_counts
+
+
+def compute_expected(
+    D_source: np.ndarray, q: np.ndarray, K: int
+) -> tuple[np.ndarray, np.ndarray]:
+    # Keep the comparison oracle local to this runner so it uses the same
+    # float32 distance path and lexicographic tie-break as the device.
     diff = D_source - q[None, :]
     all_distances = np.einsum("ij,ij->i", diff, diff).astype(np.float32)
-    all_indices = np.arange(N, dtype=np.uint32)
+    all_indices = np.arange(D_source.shape[0], dtype=np.uint32)
     order = np.lexsort((all_indices.astype(np.int64), all_distances))
-    expected_distances = all_distances[order[:K]]
-    expected_indices = all_indices[order[:K]]
+    return all_distances[order[:K]], all_indices[order[:K]]
 
+
+def memcpy_h2d_32(
+    runner: SdkRuntime,
+    symbol: int,
+    data: np.ndarray,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    length: int,
+) -> None:
+    runner.memcpy_h2d(
+        symbol,
+        data.ravel(),
+        x,
+        y,
+        width,
+        height,
+        length,
+        streaming=False,
+        data_type=MemcpyDataType.MEMCPY_32BIT,
+        order=MemcpyOrder.ROW_MAJOR,
+        nonblock=False,
+    )
+
+
+def memcpy_d2h_32(
+    runner: SdkRuntime,
+    target: np.ndarray,
+    symbol: int,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    length: int,
+) -> None:
+    runner.memcpy_d2h(
+        target,
+        symbol,
+        x,
+        y,
+        width,
+        height,
+        length,
+        streaming=False,
+        data_type=MemcpyDataType.MEMCPY_32BIT,
+        order=MemcpyOrder.ROW_MAJOR,
+        nonblock=False,
+    )
+
+
+def copy_inputs(
+    runner: SdkRuntime,
+    symbols: dict[str, int],
+    D_packed: np.ndarray,
+    D_norms_packed: np.ndarray,
+    valid_counts: np.ndarray,
+    q: np.ndarray,
+    P: int,
+    d_dim: int,
+    rows_per_pe: int,
+) -> None:
     print("Copying D shards H2D...", flush=True)
-    runner.memcpy_h2d(
-        D_symbol,
-        D_packed.ravel(),
-        0,
-        0,
-        P,
-        P,
-        rows_per_pe * d_dim,
-        streaming=False,
-        data_type=MemcpyDataType.MEMCPY_32BIT,
-        order=MemcpyOrder.ROW_MAJOR,
-        nonblock=False,
-    )
+    memcpy_h2d_32(runner, symbols["D"], D_packed, 0, 0, P, P, rows_per_pe * d_dim)
     print("Copying D norms H2D...", flush=True)
-    runner.memcpy_h2d(
-        D_norms_symbol,
-        D_norms_packed.ravel(),
-        0,
-        0,
-        P,
-        P,
-        rows_per_pe,
-        streaming=False,
-        data_type=MemcpyDataType.MEMCPY_32BIT,
-        order=MemcpyOrder.ROW_MAJOR,
-        nonblock=False,
-    )
+    memcpy_h2d_32(runner, symbols["D_norms"], D_norms_packed, 0, 0, P, P, rows_per_pe)
     print("Copying valid_count H2D...", flush=True)
-    runner.memcpy_h2d(
-        valid_count_symbol,
-        valid_counts.ravel(),
-        0,
-        0,
-        P,
-        P,
-        1,
-        streaming=False,
-        data_type=MemcpyDataType.MEMCPY_32BIT,
-        order=MemcpyOrder.ROW_MAJOR,
-        nonblock=False,
-    )
+    memcpy_h2d_32(runner, symbols["valid_count"], valid_counts, 0, 0, P, P, 1)
     print("Copying q to root H2D...", flush=True)
-    runner.memcpy_h2d(
-        q_symbol,
-        q,
-        0,
-        0,
-        1,
-        1,
-        d_dim,
-        streaming=False,
-        data_type=MemcpyDataType.MEMCPY_32BIT,
-        order=MemcpyOrder.ROW_MAJOR,
-        nonblock=False,
+    memcpy_h2d_32(runner, symbols["q"], q, 0, 0, 1, 1, d_dim)
+
+
+def read_outputs(
+    runner: SdkRuntime, symbols: dict[str, int], K: int
+) -> tuple[np.ndarray, np.ndarray]:
+    distances = np.zeros(K, dtype=np.float32)
+    indices = np.zeros(K, dtype=np.uint32)
+
+    print("Reading final distances D2H...", flush=True)
+    memcpy_d2h_32(runner, distances, symbols["distances"], 0, 0, 1, 1, K)
+    print("Reading final indices D2H...", flush=True)
+    memcpy_d2h_32(runner, indices, symbols["indices"], 0, 0, 1, 1, K)
+    return distances, indices
+
+
+def main() -> int:
+    args = parse_args()
+
+    print(f"Loading case {args.case}...", flush=True)
+    case, D_source, q = load_case(args.case)
+
+    print("Setting up runtime...", flush=True)
+    runner = SdkRuntime(args.name, cmaddr=args.cmaddr)
+    symbols = {
+        "D": runner.get_id("D"),
+        "D_norms": runner.get_id("D_norms"),
+        "q": runner.get_id("q"),
+        "valid_count": runner.get_id("valid_count"),
+        "distances": runner.get_id("distances"),
+        "indices": runner.get_id("indices"),
+    }
+
+    P, d_dim, rows_per_pe, K = read_compile_params(args.name, case, D_source)
+
+    print("Loading and starting device program...", flush=True)
+    runner.load()
+    runner.run()
+
+    print("Packing D shards...", flush=True)
+    D_packed, D_norms_packed, valid_counts = pack_inputs(
+        D_source, q, P, d_dim, rows_per_pe
+    )
+    expected_distances, expected_indices = compute_expected(D_source, q, K)
+
+    copy_inputs(
+        runner, symbols, D_packed, D_norms_packed, valid_counts, q, P, d_dim, rows_per_pe
     )
     print("Launching main...", flush=True)
     runner.launch("main", nonblock=False)
 
-    distances = np.zeros(K, dtype=np.float32)
-    indices = np.zeros(K, dtype=np.uint32)
-    print("Reading final distances D2H...", flush=True)
-    runner.memcpy_d2h(
-        distances,
-        distances_symbol,
-        0,
-        0,
-        1,
-        1,
-        K,
-        streaming=False,
-        data_type=MemcpyDataType.MEMCPY_32BIT,
-        order=MemcpyOrder.ROW_MAJOR,
-        nonblock=False,
-    )
-    print("Reading final indices D2H...", flush=True)
-    runner.memcpy_d2h(
-        indices,
-        indices_symbol,
-        0,
-        0,
-        1,
-        1,
-        K,
-        streaming=False,
-        data_type=MemcpyDataType.MEMCPY_32BIT,
-        order=MemcpyOrder.ROW_MAJOR,
-        nonblock=False,
-    )
+    distances, indices = read_outputs(runner, symbols, K)
     runner.stop()
 
     print("Comparing against reference...", flush=True)

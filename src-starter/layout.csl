@@ -1,37 +1,9 @@
-// Top-level layout entrypoint for the challenge submission.
+// Top-level layout for the distributed Top-K kNN kernel.
 //
-// Required grader parameters:
-//   P
-//   d_dim
-//   rows_per_pe
-//   K
-//
-// Build this sequentially from known-working examples:
-// - examples/tutorials/gemv-05-multiple-pes
-//   - Start here for @set_rectangle(P, P), @set_tile_code, memcpy params,
-//     and @export_name.
-// - examples/tutorials/topic-11-collectives
-//   - Use this when adding collectives_2d colors/entrypoints.
-// - examples/benchmarks/gemv-collectives_2d
-//   - Use this as the final P x P communication template.
-//
-// Step 1 scaffold:
-// - Define params P, d_dim, rows_per_pe, K.
-// - Import <memcpy/get_params> with width=P and height=P.
-// - In layout, call @set_rectangle(P, P).
-// - Loop over Px and Py and assign pe_program.csl to every tile.
-// - Export only the simplest symbols needed for a smoke test:
-//   - one input array
-//   - one output array
-//   - one main function
-//
-// Step 2 scaffold:
-// - Add D, q, valid_count, indices, distances exports.
-// - Verify host memcpy_h2d and memcpy_d2h before adding collectives.
-//
-// Step 3 scaffold:
-// - Add collectives_2d params and an explicit task/color ID map.
-// - Keep the ID map copied from the examples until we understand every ID.
+// The grader supplies P, d_dim, rows_per_pe, and K. The layout instantiates a
+// P x P rectangle, assigns the same PE program to every tile, and passes both
+// memcpy and collectives_2d parameters into that program. Host-visible symbols
+// are exported here; PE-local storage and task bindings live in pe_program.csl.
 
 param P: u16;
 param d_dim: u16;
@@ -53,6 +25,8 @@ layout {
     const memcpy_params = memcpy.get_params(x);
     while (y < P) : (y += 1) {
       const c2d_params = c2d.get_params(x, y, .{
+        // Two x-colors and two y-colors are enough for the broadcast/gather
+        // sequence used by pe_program.csl.
         .x_colors      = .{ @get_color(0),          @get_color(1) },
         .x_entrypoints = .{ @get_local_task_id(14), @get_local_task_id(15) },
         .y_colors      = .{ @get_color(4),          @get_color(5) },
@@ -70,7 +44,8 @@ layout {
     }
   }
 
-  // Final root output exports. Local candidates are gathered to PE (0,0).
+  // Inputs are host-writable on every PE except q, which run.py writes only to
+  // PE (0,0). distances/indices are read back from PE (0,0) after reduction.
   @export_name("D", [*]f32, true);
   @export_name("D_norms", [*]f32, true);
   @export_name("q", [*]f32, true);

@@ -28,7 +28,8 @@ worked, what broke, and what we plan to do next.
 - **Host runtime** (`src-starter/run.py`)
   - Loads one of the reference test cases (via `src-starter/reference.py`).
   - Packs `D` into per-PE contiguous shards (row-major across PEs).
-  - Computes and packs `D_norms` on host: `D_norms[i] = sum_j D[i,j]^2`.
+  - Computes `q_norm = sum_j q[j]^2` on host and folds it into packed norms:
+    `D_norms[i] = sum_j D[i,j]^2 + q_norm`.
   - Computes `valid_count[pe]` for uneven padding cases.
   - Copies:
     - `D` + `D_norms` + `valid_count` to **all** PEs
@@ -36,6 +37,8 @@ worked, what broke, and what we plan to do next.
   - Launches device `main`.
   - Reads back `distances`/`indices` from **PE (0,0)** and checks against the
     numpy oracle with exact tie-breaking.
+  - `src-starter/DEBUGGING.md` records the local simulator/debugger workflow,
+    including `csdb` context, trace, image, and memory commands.
 
 - **Device program** (`src-starter/pe_program.csl`)
   - Broadcasts `q` from PE (0,0) across top row, then down columns using
@@ -89,8 +92,9 @@ reducing the biggest compute hotspots first.
   - Used memory DSDs with `@map` to compute dots efficiently.
 
 - **Host-precomputed row norms**
-  - Host computes `D_norms[i] = \|D_i\|^2` once and copies alongside `D`.
-  - Device distance becomes: `D_norms[row] - 2*dot(D_row,q) + q_norm`.
+  - Host computes `D_norms[i] = \|D_i\|^2 + \|q\|^2` once and copies alongside
+    `D`.
+  - Device distance becomes: `D_norms[row] - 2*dot(D_row,q)`.
   - Allowed because it’s derived from `D` and preserves exactness.
 
 - **Hierarchical merge (row roots first)**
@@ -108,20 +112,49 @@ reducing the biggest compute hotspots first.
     - else: heap merge
 
 - **Column-wise DSD distance accumulation (GEMV-like)**
-  - Initialize `distance_scratch[:] = D_norms[:] + q_norm`
+  - Initialize `distance_scratch[:] = D_norms[:]`
   - For each dimension \(j\):
     - `distance_scratch[:] += D_column_j[:] * (-2*q[j])` via `@fmacs` with a
       strided column DSD.
   - This replaced “one dot per row” with “one streamed FMA per column”.
 
+- **Redundancy cleanup**
+  - Moved `q_norm` computation from every PE to the host and folded it into
+    host-packed `D_norms`, avoiding both repeated PE work and any larger query
+    broadcast.
+  - Removed the now-unused PE-local DSD dot helper used only for `q_norm`.
+  - Skipped `init_local_topk()` in the `K == rows_per_pe` fast path because
+    that path overwrites every local candidate slot directly.
+  - Reduced `heap_reset()` to only reset `heap_size`; heap contents are
+    overwritten by `heap_consider()` before sorted heap drain reads them.
+  - Removed a duplicate host oracle call in `run.py`; the local float32 oracle
+    remains the comparison source.
+  - Removed dead final-insertion helpers left over from an older merge path.
+  - Deliberately kept host-provided `valid_count`: it is one 32-bit word per
+    PE, while deriving it on device would require adding `N` as new state plus
+    per-PE arithmetic/branches. Any saved memcpy traffic is tiny compared with
+    the current tens-of-thousands of simulated cycles, and the derived path
+    could easily cost as much device work as it saves.
+  - Baseline measurement, compiled and run with identical params before/after
+    this cleanup:
+    - before cleanup: `cycle_count = 162716`
+    - after cleanup: `cycle_count = 162557`
+    - net baseline change: **-159 cycles**
+  - `k_large` compiled after the heap reset cleanup. A capped runtime attempt
+    stayed at `Reading final distances D2H` past the intended 10-minute window
+    and was force-stopped, so it is **not** correctness-validated in this pass.
+
 ### Current measured state (last known run)
 
 - `src-starter/sim_stats.json` currently reports:
-  - `cycle_count`: **63881**
-  - `sim_time`: **~93.8s**
+  - `cycle_count`: **78141**
+  - `sim_time`: **~76.4s**
   - `sim_stop_cause`: **Stopped due to idleness**
 
-Note: this `sim_stats.json` is a single run; it’s not a multi-case dashboard.
+Note: this `sim_stats.json` was overwritten by the interrupted `k_large`
+attempt and should not be treated as a passing `k_large` measurement. The
+verified baseline measurement from this pass was `cycle_count = 162557` with
+`PASS: baseline`.
 
 ### Known issues / recurring pain points
 
@@ -158,4 +191,3 @@ These are ordered by “most likely to help overall + easiest to validate”.
    - Explore packing `D` in a column-major or blocked format to make the
      column-wise DSD streaming even cheaper (fewer address updates / better
      burst behavior), if host packing changes are allowed.
-

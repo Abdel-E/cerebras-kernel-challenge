@@ -25,12 +25,15 @@ all PEs -> local top-K -> row roots -> PE(0,0) -> Host
 
 Each PE computes exact squared L2 distance using the identity
 `||D_i - q||^2 = ||D_i||^2 - 2 dot(D_i, q) + ||q||^2`. The host precomputes
-`D_norms`; the PE computes `dot(D_i, q)` with memory DSDs and `@map`, and
-computes `dot(q, q)` once after broadcast. Local candidates are maintained in
-`local_distances[K]` and `local_indices[K]`. For normal cases I use sorted
-insertion, `O(rows_per_pe * K)`, because it is simple and deterministic. For
-`K == rows_per_pe`, the PE writes every valid local row directly because no
-local candidate can be dropped.
+`||q||^2` and folds it into the packed row norms, so each PE receives
+`D_norms[i] = ||D_i||^2 + ||q||^2` and does not repeat the q-norm dot product.
+Distance accumulation is column-wise: initialize `distance_scratch[:]` from
+`D_norms[:]`, then for each dimension stream the corresponding
+strided D column through `@fmacs` with `-2*q[j]`. Local candidates are
+maintained in `local_distances[K]` and `local_indices[K]`. For normal cases I
+use sorted insertion, `O(rows_per_pe * K)`, because it is simple and
+deterministic. For `K == rows_per_pe`, the PE writes every valid local row
+directly because no local candidate can be dropped.
 
 ## Fabric Bandwidth
 
@@ -54,6 +57,6 @@ beat real candidates.
 ## If I Had 2x More Time
 
 I would further optimize `k_large` with a more efficient sorted-output path for
-large K, such as a heap extraction/tournament merge specialized for sorted
-candidate lists. I would also tune the distance kernel further around DSD layout
-and row packing so each PE streams row data through fewer scalar operations.
+large K, such as heap extraction or a tournament merge specialized for sorted
+candidate lists. I would also tune the distance kernel around DSD layout and row
+packing so each PE streams row data with fewer address updates.
