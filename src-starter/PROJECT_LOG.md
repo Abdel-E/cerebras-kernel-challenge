@@ -186,13 +186,39 @@ reducing the biggest compute hotspots first.
     the k-way result.
   - `k_large` compile-check passed on the heap path.
 
+#### 6) Follow-up optimization experiments
+
+- **Column-major PE-local `D` packing: rejected**
+  - Changed host packing and PE DSD access so each feature column was contiguous
+    in local PE memory.
+  - Correctness passed, but baseline regressed from `114864` to `117934`
+    cycles, so the change was reverted.
+- **Guarded heap-local selection for mid-sized K: kept**
+  - Added a heap-based local selection path only for `K > 16` and
+    `K != rows_per_pe`.
+  - Existing small-K paths still use sorted insertion, preserving the cheap
+    k-way merge input streams.
+  - Existing `k_large` still uses the direct `K == rows_per_pe` path.
+  - Validation:
+    - synthetic `K=32` compile-check passed, exercising the new branch
+    - `baseline` passed with `cycle_count = 114862`
+    - `k_large` compile-check passed
+- **Dynamic valid-count DSD length: rejected**
+  - Short-shard DSD capping compiled and passed correctness, but baseline
+    regressed from `114862` to `115080`, and uneven regressed from `70081` to
+    `70236`.
+  - The change was reverted.
+
 ### Current measured state (last known run)
 
-- `src-starter/sim_stats.json` currently reports the latest `baseline`
-  validation run after the task/color ID remap:
-  - `cycle_count`: **114864**
-  - `sim_time`: **~166.2s**
+- `src-starter/sim_stats.json` currently reports the latest final `uneven`
+  validation run after the kept guarded heap-local change:
+  - `cycle_count`: **70092**
+  - `sim_time`: **~103.9s**
   - `sim_stop_cause`: **Stopped due to idleness**
+- The final accepted `baseline` measurement after the kept guarded heap-local
+  change is **114863** cycles, matching the previous **114864** reference
+  within simulator noise.
 
 Recent important reference measurements:
 - `baseline` after k-way merge: `cycle_count = 114862`, `PASS: baseline`.
@@ -226,11 +252,14 @@ These are ordered by “most likely to help overall + easiest to validate”.
      the k-way sorted-stream path.
 
 4) **k_large-specific improvements**
+   - The guarded heap-local path is now available for mid-sized K, but the
+     known `k_large` case still uses direct local output because
+     `K == rows_per_pe`.
    - Explore whether `K == rows_per_pe` can cheaply produce sorted local
      streams; if so, a k-way merge could replace heap merging for large K too.
    - Explore multi-stage reduction for `P=2, K=256` so the root does less work.
 
 5) **Memory layout tuning**
-   - Explore packing `D` in a column-major or blocked format to make the
-     column-wise DSD streaming even cheaper (fewer address updates / better
-     burst behavior), if host packing changes are allowed.
+   - Simple PE-local column-major packing regressed baseline in this simulator.
+     Any future layout tuning should use a blocked format or a debugger-guided
+     instruction-level hypothesis rather than a plain transpose.

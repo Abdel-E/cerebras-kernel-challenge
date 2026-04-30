@@ -292,6 +292,16 @@ fn compute_local_topk() void {
 
     local_distances[0] = best_distance;
     local_indices[0] = best_index;
+  } else if (K > 16) {
+    heap_reset();
+    for (@range(u16, rows_per_pe)) |row| {
+      if (@as(u32, row) < valid_count[0]) {
+        const distance = distance_scratch[row];
+        const global_index = global_base + @as(u32, row);
+        heap_consider(distance, global_index);
+      }
+    }
+    write_heap_sorted(&local_distances, &local_indices);
   } else {
     init_local_topk();
     for (@range(u16, rows_per_pe)) |row| {
