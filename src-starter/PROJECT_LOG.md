@@ -209,21 +209,49 @@ reducing the biggest compute hotspots first.
     `70236`.
   - The change was reverted.
 
-### Current measured state (last known run)
+#### 7) Baseline specialization + case-tracked profiling pass
 
-- `src-starter/sim_stats.json` currently reports the latest final `uneven`
-  validation run after the kept guarded heap-local change:
-  - `cycle_count`: **70092**
-  - `sim_time`: **~103.9s**
-  - `sim_stop_cause`: **Stopped due to idleness**
-- The final accepted `baseline` measurement after the kept guarded heap-local
-  change is **114863** cycles, matching the previous **114864** reference
-  within simulator noise.
+- **Local K=16 specialization (kept)**
+  - Added a baseline-focused local top-K path for `K==16` that:
+    - seeds with the first valid rows,
+    - sorts the 16-slot seed once,
+    - then inserts only later candidates that beat slot 15.
+  - This removes repeated INF-seeding/insertion churn in the hot baseline path.
 
-Recent important reference measurements:
-- `baseline` after k-way merge: `cycle_count = 114862`, `PASS: baseline`.
-- `k_large` after heap-pop drain: `cycle_count = 712258`, `PASS: k_large`,
-  under the 10-minute frame in this simulator run.
+- **Scalar precompute in distance loop (kept)**
+  - Added `scaled_q[j] = -2*q[j]` precompute once per compute task.
+  - The streamed column FMAs now reuse `scaled_q[j]` in `compute_all_distances()`
+    rather than rematerializing `-2.0*q[j]` every iteration.
+
+- **`K==rows_per_pe` sorted-stream option (kept)**
+  - Added an optional branch (`SORT_STREAMS_WHEN_FULL_K = true`) that uses a
+    local heap sort when `K==rows_per_pe` and `K>16`, producing sorted local
+    streams.
+  - Row/final reducers now use the existing k-way merge when this condition is
+    enabled, replacing heap merge at those stages for full-K runs.
+
+- **Per-case stats snapshotting (kept)**
+  - `run.py` now supports `--stats-dir` and writes
+    `<stats-dir>/<case>.json` snapshots from `sim_stats.json`.
+  - Added `run_all_cases.sh` to compile + run all six challenge cases and print
+    a summary table from `out/stats/*.json`.
+
+### Current measured state (latest full sweep)
+
+Full six-case sweep run via `src-starter/run_all_cases.sh` with stats captured
+to `src-starter/out/stats/*.json`:
+
+- `baseline`: `cycle_count = 111560`, `sim_time ≈ 177.835s`
+- `k_eq_1`: `cycle_count = 78650`, `sim_time ≈ 98.985s`
+- `k_large`: `cycle_count = 325746`, `sim_time ≈ 455.440s`
+- `uneven`: `cycle_count = 66883`, `sim_time ≈ 112.009s`
+- `all_equal`: `cycle_count = 54472`, `sim_time ≈ 92.357s`
+- `duplicates`: `cycle_count = 58052`, `sim_time ≈ 77.116s`
+
+Relative to the previously logged references:
+- baseline improved from ~`114862` to `111560` (about **-2.9%**),
+- `k_large` improved strongly from the previously logged `712258` to `325746`
+  in this run configuration.
 
 ### Known issues / recurring pain points
 

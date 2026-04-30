@@ -34,3 +34,11 @@ The intended flow is:
 3. Use `SELF_QUIZ.md` to check whether you can explain the concept.
 4. Only after the architecture is clear, compress the notebook into
    `DESIGN.md` and start implementation.
+
+## Per-case cycle tracking
+
+- `run.py` supports `--stats-dir <dir>` and snapshots `sim_stats.json` to
+  `<dir>/<case>.json` after each run.
+- `commands.sh` writes baseline stats to `out/stats/baseline.json`.
+- `run_all_cases.sh` compiles/runs all six challenge cases and prints a summary
+  table from `out/stats/*.json`.

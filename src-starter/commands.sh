@@ -5,6 +5,7 @@ set -euo pipefail
 # Fill in layout.csl and run.py first, then use this script as your quick loop.
 
 mkdir -p out
+mkdir -p out/stats
 
 cslc --arch=wse2 layout.csl \
   --fabric-dims=11,6 \
@@ -13,4 +14,4 @@ cslc --arch=wse2 layout.csl \
   --memcpy --channels=1 \
   -o out/baseline
 
-cs_python run.py --name out/baseline --case baseline
+cs_python run.py --name out/baseline --case baseline --stats-dir out/stats

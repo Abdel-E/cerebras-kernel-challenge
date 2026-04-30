@@ -32,12 +32,15 @@ const mpi_y = @import_module("<collectives_2d/pe>", .{ .dim_params = c2d_params.
 const D_LEN: u16 = rows_per_pe * d_dim;
 const rows_per_pe_i16: i16 = @as(i16, rows_per_pe);
 const d_dim_i16: i16 = @as(i16, d_dim);
+const BASELINE_K: u16 = 16;
+const SORT_STREAMS_WHEN_FULL_K: bool = true;
 const INF: f32 = 1.0e30;
 const SENTINEL_INDEX: u32 = 2147483647;
 
 var D = @zeros([D_LEN]f32);
 var D_norms = @zeros([rows_per_pe]f32);
 var q = @zeros([d_dim]f32);
+var scaled_q = @zeros([d_dim]f32);
 var valid_count = @zeros([1]u32);
 var distance_scratch = @zeros([rows_per_pe]f32);
 var local_distances = @zeros([K]f32);
@@ -246,6 +249,82 @@ fn merge_buffer_with_heap(src_distances: [*]f32, src_indices: [*]u32,
   write_heap_sorted(out_distances, out_indices);
 }
 
+fn prepare_scaled_q() void {
+  for (@range(u16, d_dim)) |j| {
+    scaled_q[j] = -2.0 * q[j];
+  }
+}
+
+fn insert_local_k16(distance: f32, index: u32) void {
+  var pos: i16 = 15;
+  if (!better(distance, index, local_distances[pos], local_indices[pos])) {
+    return;
+  }
+
+  while (pos > 0) : (pos -= 1) {
+    const prev = pos - 1;
+    if (!better(distance, index, local_distances[prev], local_indices[prev])) {
+      break;
+    }
+    local_distances[pos] = local_distances[prev];
+    local_indices[pos] = local_indices[prev];
+  }
+
+  local_distances[pos] = distance;
+  local_indices[pos] = index;
+}
+
+fn seed_sort_local_k16() void {
+  for (@range(u16, 15)) |i| {
+    const start = i + 1;
+    const key_distance = local_distances[start];
+    const key_index = local_indices[start];
+    var pos: i16 = @as(i16, i);
+    while (pos >= 0) : (pos -= 1) {
+      if (!better(key_distance, key_index,
+                  local_distances[@as(u16, pos)], local_indices[@as(u16, pos)])) {
+        break;
+      }
+      local_distances[@as(u16, pos + 1)] = local_distances[@as(u16, pos)];
+      local_indices[@as(u16, pos + 1)] = local_indices[@as(u16, pos)];
+    }
+    local_distances[@as(u16, pos + 1)] = key_distance;
+    local_indices[@as(u16, pos + 1)] = key_index;
+  }
+}
+
+fn compute_local_topk_k16(global_base: u32) void {
+  var valid_rows: u16 = rows_per_pe;
+  if (valid_count[0] < @as(u32, rows_per_pe)) {
+    valid_rows = @as(u16, valid_count[0]);
+  }
+
+  var seeded: u16 = BASELINE_K;
+  if (valid_rows < BASELINE_K) {
+    seeded = valid_rows;
+  }
+
+  for (@range(u16, BASELINE_K)) |slot| {
+    if (slot < seeded) {
+      local_distances[slot] = distance_scratch[slot];
+      local_indices[slot] = global_base + @as(u32, slot);
+    } else {
+      local_distances[slot] = INF;
+      local_indices[slot] = SENTINEL_INDEX;
+    }
+  }
+
+  if (seeded > 1) {
+    seed_sort_local_k16();
+  }
+
+  for (@range(u16, rows_per_pe)) |row| {
+    if ((row >= seeded) and (row < valid_rows)) {
+      insert_local_k16(distance_scratch[row], global_base + @as(u32, row));
+    }
+  }
+}
+
 fn compute_all_distances() void {
   // D_norms already includes ||q||^2:
   // distance_scratch[row] = D_norms[row] - 2 * dot(D_row, q).
@@ -253,7 +332,7 @@ fn compute_all_distances() void {
   @fadds(dist_dsd, norms_dsd, 0.0);
   var col_dsd = D_col_dsd;
   for (@range(u16, d_dim)) |j| {
-    @fmacs(dist_dsd, dist_dsd, col_dsd, -2.0 * q[j]);
+    @fmacs(dist_dsd, dist_dsd, col_dsd, scaled_q[j]);
     col_dsd = @increment_dsd_offset(col_dsd, 1, f32);
   }
 }
@@ -264,15 +343,28 @@ fn compute_local_topk() void {
   compute_all_distances();
 
   if (K == rows_per_pe) {
-    // k_large asks for every local row when K == rows_per_pe. In that case
-    // neither sorted insertion nor top-K initialization is needed.
-    for (@range(u16, rows_per_pe)) |row| {
-      if (@as(u32, row) < valid_count[0]) {
-        local_distances[row] = distance_scratch[row];
-        local_indices[row] = global_base + @as(u32, row);
-      } else {
-        local_distances[row] = INF;
-        local_indices[row] = SENTINEL_INDEX;
+    if (SORT_STREAMS_WHEN_FULL_K and (K > BASELINE_K)) {
+      // Optional k_large experiment: keep fully sorted local streams so row/final
+      // reducers can use the k-way stream merge path.
+      heap_reset();
+      for (@range(u16, rows_per_pe)) |row| {
+        if (@as(u32, row) < valid_count[0]) {
+          heap_consider(distance_scratch[row], global_base + @as(u32, row));
+        } else {
+          heap_consider(INF, SENTINEL_INDEX);
+        }
+      }
+      write_heap_sorted(&local_distances, &local_indices);
+    } else {
+      // Fast path when every local row is requested.
+      for (@range(u16, rows_per_pe)) |row| {
+        if (@as(u32, row) < valid_count[0]) {
+          local_distances[row] = distance_scratch[row];
+          local_indices[row] = global_base + @as(u32, row);
+        } else {
+          local_distances[row] = INF;
+          local_indices[row] = SENTINEL_INDEX;
+        }
       }
     }
   } else if (K == 1) {
@@ -292,6 +384,8 @@ fn compute_local_topk() void {
 
     local_distances[0] = best_distance;
     local_indices[0] = best_index;
+  } else if (K == BASELINE_K) {
+    compute_local_topk_k16(global_base);
   } else if (K > 16) {
     heap_reset();
     for (@range(u16, rows_per_pe)) |row| {
@@ -317,7 +411,7 @@ fn compute_local_topk() void {
 fn merge_global_topk() void {
   // Small cases avoid heap overhead; large K uses a fixed-size max-heap to
   // avoid insertion shifts in the merge buffers.
-  if (K <= 16) {
+  if ((K <= BASELINE_K) or (SORT_STREAMS_WHEN_FULL_K and (K == rows_per_pe))) {
     merge_sorted_streams(&all_distances, &all_indices,
                          &final_distances, &final_indices);
   } else {
@@ -328,7 +422,7 @@ fn merge_global_topk() void {
 
 fn merge_row_topk() void {
   // Row roots use the same policy as the final root.
-  if (K <= 16) {
+  if ((K <= BASELINE_K) or (SORT_STREAMS_WHEN_FULL_K and (K == rows_per_pe))) {
     merge_sorted_streams(&row_distances, &row_indices,
                          &row_top_distances, &row_top_indices);
   } else {
@@ -357,6 +451,7 @@ task bcast_q_down() void {
 }
 
 task compute() void {
+  prepare_scaled_q();
   compute_local_topk();
   // Gather distances first, then indices, so both arrays use simple contiguous
   // K-element collectives.
@@ -375,7 +470,9 @@ task gather_col_distances() void {
     mpi_y.gather(0, @ptrcast([*]u32, &row_top_distances),
                  @ptrcast([*]u32, &all_distances), K, gather_col_i_task_id);
   } else {
-    @activate(gather_col_i_task_id);
+    // Non-column PEs do not participate in the y-collectives. Unblock here
+    // instead of bouncing through two additional no-op callbacks.
+    sys_mod.unblock_cmd_stream();
   }
 }
 
@@ -383,8 +480,6 @@ task gather_col_indices() void {
   if (px == 0) {
     mpi_y.gather(0, @ptrcast([*]u32, &row_top_indices),
                  @ptrcast([*]u32, &all_indices), K, finish_task_id);
-  } else {
-    @activate(finish_task_id);
   }
 }
 

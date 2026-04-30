@@ -36,6 +36,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--name", required=True, help="Compiled output directory")
     parser.add_argument("--case", required=True, help="Reference test case name")
     parser.add_argument("--cmaddr", help="IP:port for CS system")
+    parser.add_argument(
+        "--stats-dir",
+        help="Optional directory to store per-case sim_stats snapshots",
+    )
     return parser.parse_args()
 
 
@@ -198,6 +202,30 @@ def read_outputs(
     return distances, indices
 
 
+def snapshot_sim_stats(case_key: str, build_name: str, stats_dir: str | None) -> None:
+    if not stats_dir:
+        return
+
+    source = Path("sim_stats.json")
+    if not source.exists():
+        print("sim_stats.json not found; skipping stats snapshot.", flush=True)
+        return
+
+    with open(source, encoding="utf-8") as infile:
+        stats = json.load(infile)
+
+    stats["_case"] = case_key
+    stats["_build"] = build_name
+
+    output_dir = Path(stats_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{case_key}.json"
+    with open(output_path, "w", encoding="utf-8") as outfile:
+        json.dump(stats, outfile, indent=2, sort_keys=True)
+        outfile.write("\n")
+    print(f"Saved sim stats snapshot: {output_path}", flush=True)
+
+
 def main() -> int:
     args = parse_args()
 
@@ -235,6 +263,7 @@ def main() -> int:
 
     distances, indices = read_outputs(runner, symbols, K)
     runner.stop()
+    snapshot_sim_stats(args.case, args.name, args.stats_dir)
 
     print("Comparing against reference...", flush=True)
     np.testing.assert_allclose(distances, expected_distances, atol=1e-3, rtol=1e-3)
