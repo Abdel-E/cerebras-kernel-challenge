@@ -28,9 +28,9 @@ layout {
         // Two x-colors and two y-colors are enough for the broadcast/gather
         // sequence used by pe_program.csl.
         .x_colors      = .{ @get_color(0),          @get_color(1) },
-        .x_entrypoints = .{ @get_local_task_id(14), @get_local_task_id(15) },
+        .x_entrypoints = .{ @get_local_task_id(10), @get_local_task_id(11) },
         .y_colors      = .{ @get_color(4),          @get_color(5) },
-        .y_entrypoints = .{ @get_local_task_id(16), @get_local_task_id(17) },
+        .y_entrypoints = .{ @get_local_task_id(12), @get_local_task_id(13) },
       });
 
       @set_tile_code(x, y, "pe_program.csl", .{

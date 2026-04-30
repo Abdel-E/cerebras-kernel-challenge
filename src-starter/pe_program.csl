@@ -18,13 +18,12 @@ param d_dim: u16;
 param rows_per_pe: u16;
 param K: u16;
 
-const bcast_q_down_task_id: local_task_id = @get_local_task_id(10);
-const compute_task_id:      local_task_id = @get_local_task_id(11);
-const gather_row_d_task_id: local_task_id = @get_local_task_id(12);
-const gather_row_i_task_id: local_task_id = @get_local_task_id(13);
-const gather_col_d_task_id: local_task_id = @get_local_task_id(18);
-const gather_col_i_task_id: local_task_id = @get_local_task_id(19);
-const finish_task_id:       local_task_id = @get_local_task_id(9);
+const bcast_q_down_task_id: local_task_id = @get_local_task_id(6);
+const compute_task_id:      local_task_id = @get_local_task_id(7);
+const gather_row_i_task_id: local_task_id = @get_local_task_id(8);
+const gather_col_d_task_id: local_task_id = @get_local_task_id(9);
+const gather_col_i_task_id: local_task_id = @get_local_task_id(14);
+const finish_task_id:       local_task_id = @get_local_task_id(18);
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const mpi_x = @import_module("<collectives_2d/pe>", .{ .dim_params = c2d_params.x });
@@ -52,6 +51,7 @@ var all_indices = @zeros([P * K]u32);
 var heap_distances = @zeros([K]f32);
 var heap_indices = @zeros([K]u32);
 var heap_size: u16 = 0;
+var merge_offsets = @zeros([P]u16);
 var final_distances = @zeros([K]f32);
 var final_indices = @zeros([K]u32);
 var ptr_D: [*]f32 = &D;
@@ -204,27 +204,36 @@ fn write_heap_sorted(out_distances: [*]f32, out_indices: [*]u32) void {
   }
 }
 
-fn select_topk_from_buffer(
+fn merge_sorted_streams(
     src_distances: [*]f32, src_indices: [*]u32,
     out_distances: [*]f32, out_indices: [*]u32) void {
-  // For small K, repeated best-selection is cheaper than heap maintenance.
+  // Small-K candidates arrive as P sorted K-lists. Merge by advancing one
+  // cursor per source stream instead of repeatedly rescanning the whole buffer.
+  for (@range(u16, P)) |stream| {
+    merge_offsets[stream] = 0;
+  }
+
   for (@range(u16, K)) |out_idx| {
-    var best_pos: u16 = 0;
+    var best_stream: u16 = 0;
     var best_distance: f32 = INF;
     var best_index: u32 = SENTINEL_INDEX;
 
-    for (@range(u16, P * K)) |i| {
-      if (better(src_distances[i], src_indices[i], best_distance, best_index)) {
-        best_pos = i;
-        best_distance = src_distances[i];
-        best_index = src_indices[i];
+    for (@range(u16, P)) |stream| {
+      const offset = merge_offsets[stream];
+      if (offset < K) {
+        const candidate_pos = stream * K + offset;
+        if (better(src_distances[candidate_pos], src_indices[candidate_pos],
+                   best_distance, best_index)) {
+          best_stream = stream;
+          best_distance = src_distances[candidate_pos];
+          best_index = src_indices[candidate_pos];
+        }
       }
     }
 
     out_distances[out_idx] = best_distance;
     out_indices[out_idx] = best_index;
-    src_distances[best_pos] = INF;
-    src_indices[best_pos] = SENTINEL_INDEX;
+    merge_offsets[best_stream] += 1;
   }
 }
 
@@ -299,8 +308,8 @@ fn merge_global_topk() void {
   // Small cases avoid heap overhead; large K uses a fixed-size max-heap to
   // avoid insertion shifts in the merge buffers.
   if (K <= 16) {
-    select_topk_from_buffer(&all_distances, &all_indices,
-                            &final_distances, &final_indices);
+    merge_sorted_streams(&all_distances, &all_indices,
+                         &final_distances, &final_indices);
   } else {
     merge_buffer_with_heap(&all_distances, &all_indices,
                            &final_distances, &final_indices);
@@ -310,8 +319,8 @@ fn merge_global_topk() void {
 fn merge_row_topk() void {
   // Row roots use the same policy as the final root.
   if (K <= 16) {
-    select_topk_from_buffer(&row_distances, &row_indices,
-                            &row_top_distances, &row_top_indices);
+    merge_sorted_streams(&row_distances, &row_indices,
+                         &row_top_distances, &row_top_indices);
   } else {
     merge_buffer_with_heap(&row_distances, &row_indices,
                            &row_top_distances, &row_top_indices);

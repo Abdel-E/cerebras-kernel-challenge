@@ -108,8 +108,12 @@ reducing the biggest compute hotspots first.
 - **Merge policy by K**
   - For small K, the heap overhead regressed.
   - Policy now is:
-    - if `K <= 16`: repeated selection
+    - if `K <= 16`: k-way merge of sorted candidate streams
     - else: heap merge
+  - The small-K k-way path uses one cursor per source PE. Because each local
+    candidate list is already sorted by `(distance, index)`, row roots and the
+    final root reduce `P` sorted streams with `O(K*P)` comparisons instead of
+    rescanning the full `P*K` buffer for every output.
 
 - **Column-wise DSD distance accumulation (GEMV-like)**
   - Initialize `distance_scratch[:] = D_norms[:]`
@@ -144,17 +148,56 @@ reducing the biggest compute hotspots first.
     stayed at `Reading final distances D2H` past the intended 10-minute window
     and was force-stopped, so it is **not** correctness-validated in this pass.
 
+#### 4) Small-K k-way merge
+
+- Replaced the old small-K repeated-selection merge with k-way merging of
+  sorted per-PE candidate streams.
+- This preserves exact deterministic ordering because every stream is sorted by
+  the same total order used globally.
+- Baseline measurement:
+  - before k-way merge: `cycle_count = 161918`
+  - after k-way merge: `cycle_count = 114862`
+  - net baseline change: **-47056 cycles** (~29.1% fewer cycles)
+- Correctness checks passed after the change:
+  - `baseline`
+  - `k_eq_1`
+  - `duplicates`
+  - `all_equal`
+  - `uneven`
+- `k_large` still compiles on the heap path; it is intentionally unaffected by
+  this optimization because the `K == rows_per_pe` local output is not sorted by
+  distance.
+
+#### 5) Task/color ID hygiene
+
+- Updated `layout.csl` so the `collectives_2d` entrypoints match the documented
+  ID map:
+  - x entrypoints: task IDs `10`, `11`
+  - y entrypoints: task IDs `12`, `13`
+- Moved application callbacks out of collectives and memcpy-reserved IDs:
+  - `bcast_q_down`: `6`
+  - `compute`: `7`
+  - `gather_row_indices`: `8`
+  - `gather_col_distances`: `9`
+  - `gather_col_indices`: `14`
+  - `finish`: `18`
+- Validation:
+  - `baseline` passed with `cycle_count = 114864`, essentially unchanged from
+    the k-way result.
+  - `k_large` compile-check passed on the heap path.
+
 ### Current measured state (last known run)
 
-- `src-starter/sim_stats.json` currently reports:
-  - `cycle_count`: **78141**
-  - `sim_time`: **~76.4s**
+- `src-starter/sim_stats.json` currently reports the latest `baseline`
+  validation run after the task/color ID remap:
+  - `cycle_count`: **114864**
+  - `sim_time`: **~166.2s**
   - `sim_stop_cause`: **Stopped due to idleness**
 
-Note: this `sim_stats.json` was overwritten by the interrupted `k_large`
-attempt and should not be treated as a passing `k_large` measurement. The
-verified baseline measurement from this pass was `cycle_count = 162557` with
-`PASS: baseline`.
+Recent important reference measurements:
+- `baseline` after k-way merge: `cycle_count = 114862`, `PASS: baseline`.
+- `k_large` after heap-pop drain: `cycle_count = 712258`, `PASS: k_large`,
+  under the 10-minute frame in this simulator run.
 
 ### Known issues / recurring pain points
 
@@ -179,12 +222,12 @@ These are ordered by “most likely to help overall + easiest to validate”.
      distances for winners), if it fits the symbol + memcpy constraints.
 
 3) **Specialize the baseline path (`P=4, K=16, d=32`)**
-   - Hand-tune local selection and merge for K=16 (see baseline optimizations
-     below).
+   - Hand-tune local selection for K=16; merge has already been improved with
+     the k-way sorted-stream path.
 
 4) **k_large-specific improvements**
-   - Replace “sorted output from heap by scanning K times” with an extraction
-     procedure (or a tournament / k-way merge if inputs are already sorted).
+   - Explore whether `K == rows_per_pe` can cheaply produce sorted local
+     streams; if so, a k-way merge could replace heap merging for large K too.
    - Explore multi-stage reduction for `P=2, K=256` so the root does less work.
 
 5) **Memory layout tuning**
