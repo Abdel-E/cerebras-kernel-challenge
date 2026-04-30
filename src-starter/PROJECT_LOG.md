@@ -253,6 +253,69 @@ Relative to the previously logged references:
 - `k_large` improved strongly from the previously logged `712258` to `325746`
   in this run configuration.
 
+### 8) `P=2` k-way merge specialization pass
+
+- **What changed (kept)**
+  - `merge_sorted_streams()` now has a dedicated `P==2` fast path.
+  - Instead of a generic “scan all streams each output” loop, it uses two
+    cursors (`offset0`, `offset1`) and one direct compare between stream heads.
+  - This removes loop/control overhead in the hottest reduction path for the
+    `P=2` cases while preserving exact `(distance, index)` ordering.
+
+- **Why this helps**
+  - For `P=2`, the generic path still did per-output loop mechanics designed for
+    arbitrary fan-in. The specialized path is the minimal operation set:
+    one head-to-head compare + one cursor increment per emitted output.
+  - It benefits both row-root and final-root merge stages wherever the k-way
+    sorted-stream merge policy is active.
+
+- **Validation + measured deltas (full six-case sweep)**
+  - New sweep results:
+    - `baseline`: `111561`
+    - `k_eq_1`: `78634`
+    - `k_large`: `318377`
+    - `uneven`: `66886`
+    - `all_equal`: `54868`
+    - `duplicates`: `57830`
+  - Versus the immediately prior sweep:
+    - `k_large`: `325746 -> 318377` (**-7369**, ~**-2.3%**)
+    - `duplicates`: `58052 -> 57830` (**-222**, ~**-0.4%**)
+    - `k_eq_1`: `78650 -> 78634` (**-16**, tiny improvement)
+    - `baseline`/`uneven`: effectively flat (noise-level change)
+    - `all_equal`: slightly worse in this run (`+396`, ~`+0.7%`)
+  - Net: the specialization appears to be a real `k_large` win without broad
+    regressions; minor per-case jitter remains expected in simulator runs.
+
+### Why the `k_large` improvement is so large
+
+`k_large` (`P=2, K=256, rows_per_pe=256`) is dominated by reduction work at the
+roots. The previous full-K path produced unsorted local buffers and then relied
+on heap-based root merges over `P*K` candidates at each reduction stage.
+
+The new full-K option changes that critical path:
+
+1. **Local sorting moved to all PEs (parallel work).**
+   - Each PE heap-sorts its own 256 candidates into deterministic ascending
+     streams once.
+   - This added local work is spread across all participating PEs, so it does
+     not create a new serial bottleneck.
+
+2. **Root merges switched from heap scans to k-way stream merge.**
+   - With sorted local streams, row/root reducers now use the existing small-K
+     stream-merger logic (`O(K*P)` comparisons) instead of heap buffering over
+     the full `P*K` list.
+   - For `P=2`, this is especially favorable: selecting each next winner is a
+     tiny two-stream compare rather than repeated heap maintenance.
+
+3. **Work moved off the serialized root-heavy phase.**
+   - Prior root merging was on the reduction critical path; any savings there
+     directly reduce end-to-end cycles.
+   - The new flow shifts effort toward per-PE local preparation and away from
+     root hotspots, which is why the cycle drop is disproportionally large.
+
+Net effect in this environment: `k_large` fell from the previously logged
+`712258` to `325746` cycles in the latest run configuration.
+
 ### Known issues / recurring pain points
 
 - **“Hang” on `memcpy_d2h`**: usually the device pipeline is just still running
@@ -264,30 +327,24 @@ Relative to the previously logged references:
 
 These are ordered by “most likely to help overall + easiest to validate”.
 
-1) **Baseline-focused profiling**
-   - Capture `sim_stats.json` for baseline specifically and keep a history
-     (e.g. `sim_stats_baseline.json`, etc.) so we can see regressions.
+1) **Ablate full-K merge policy for `k_large`**
+   - Keep a compile-time switch between:
+     - full-K sorted-stream path (`SORT_STREAMS_WHEN_FULL_K = true`)
+     - prior full-K direct-local + root-heap path
+   - Measure both with identical toolchain/runtime settings to confirm the win
+     persists and quantify variance.
 
-2) **Reduce avoidable fabric traffic**
-   - Consider sending **only indices** when possible (recompute distance at the
-     root from stored per-PE distances), or compress `(distance,index)` pairs
-     if allowed.
-   - Consider a different gather schedule (e.g. gather only indices then fetch
-     distances for winners), if it fits the symbol + memcpy constraints.
+2) **Tighten the baseline `K=16` local path further**
+   - Evaluate an explicitly unrolled insert for K=16 (or small fixed blocks)
+     versus current looped insertion to reduce branch/control overhead.
+   - Keep this gated to `K==16` only to avoid regressing other cases.
 
-3) **Specialize the baseline path (`P=4, K=16, d=32`)**
-   - Hand-tune local selection for K=16; merge has already been improved with
-     the k-way sorted-stream path.
+3) **Selective trace-guided stall reduction**
+   - Capture case-specific traces on baseline and k_large and attribute stalls
+     around gather callbacks vs compute loop.
+   - Use that evidence to decide whether callback/task sequencing refinements
+     (not payload packing) can reduce idle gaps.
 
-4) **k_large-specific improvements**
-   - The guarded heap-local path is now available for mid-sized K, but the
-     known `k_large` case still uses direct local output because
-     `K == rows_per_pe`.
-   - Explore whether `K == rows_per_pe` can cheaply produce sorted local
-     streams; if so, a k-way merge could replace heap merging for large K too.
-   - Explore multi-stage reduction for `P=2, K=256` so the root does less work.
-
-5) **Memory layout tuning**
-   - Simple PE-local column-major packing regressed baseline in this simulator.
-     Any future layout tuning should use a blocked format or a debugger-guided
-     instruction-level hypothesis rather than a plain transpose.
+4) **Keep per-case stats history as regression guardrail**
+   - Continue writing `out/stats/<case>.json` each run and compare against prior
+     snapshots before accepting optimization changes.

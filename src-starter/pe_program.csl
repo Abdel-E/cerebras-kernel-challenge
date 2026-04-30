@@ -212,6 +212,30 @@ fn merge_sorted_streams(
     out_distances: [*]f32, out_indices: [*]u32) void {
   // Small-K candidates arrive as P sorted K-lists. Merge by advancing one
   // cursor per source stream instead of repeatedly rescanning the whole buffer.
+  if (P == 2) {
+    // Hot path specialization: avoid generic per-output stream scan when the
+    // merge fan-in is exactly two sorted streams.
+    var offset0: u16 = 0;
+    var offset1: u16 = 0;
+    for (@range(u16, K)) |out_idx| {
+      const has0 = offset0 < K;
+      const has1 = offset1 < K;
+
+      if (has0 and
+          (!has1 or better(src_distances[offset0], src_indices[offset0],
+                           src_distances[K + offset1], src_indices[K + offset1]))) {
+        out_distances[out_idx] = src_distances[offset0];
+        out_indices[out_idx] = src_indices[offset0];
+        offset0 += 1;
+      } else {
+        out_distances[out_idx] = src_distances[K + offset1];
+        out_indices[out_idx] = src_indices[K + offset1];
+        offset1 += 1;
+      }
+    }
+    return;
+  }
+
   for (@range(u16, P)) |stream| {
     merge_offsets[stream] = 0;
   }
