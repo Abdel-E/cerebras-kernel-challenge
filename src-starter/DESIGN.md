@@ -37,7 +37,7 @@ Local selection depends on K:
 - Full local K (`K == rows_per_pe`): keep every valid local row. For `k_large`, heap-sort the full stream, `O(rows_per_pe log rows_per_pe)`, so reducers can merge sorted streams.
 - Larger non-full K: max-heap of size K, `O(rows_per_pe log K)`.
 
-I chose this mixed policy because no single method was best for every K. Sorted insertion is cheap for small K and produces sorted streams, which makes reduction cheaper. The heap is better for large K because it avoids shifting up to K entries on each insert.
+I chose this mixed strategy because no single method was best for every K. Sorted insertion is cheap for small K and produces sorted streams, which makes reduction cheaper. The heap is better for large K because it avoids shifting up to K entries on each insert.
 
 ## Fabric Bandwidth
 
