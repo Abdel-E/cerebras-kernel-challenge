@@ -1,7 +1,7 @@
 # DESIGN
 
 Start time: 9:38 PM EST, April 28, 2026  
-Finish time: 7:20 PM EST, May 1, 2026
+Finish time: 7:30 PM EST, May 1, 2026
 
 ## Routing Topology
 
@@ -21,7 +21,7 @@ The x entrypoints are task IDs `10/11`; y entrypoints are `12/13`. Query wavelet
 
 All cases first compute exact squared L2 distances:
 `||D_i - q||^2 = ||D_i||^2 + ||q||^2 - 2 * dot(D_i, q)`.
-The host precomputes `D_norms = ||D_i||^2 + ||q||^2`, so the PE only adds `-2 * dot(D_i, q)`. The dominant loop is distance accumulation, `O(rows_per_pe * d_dim)`: each feature uses one vector `@fmacs` over local rows. The first FMAC starts from `D_norms`, so there is no initialization sweep. When `d_dim` is divisible by 8, host packing makes the DSD stride 8.
+The host precomputes `D_norms = ||D_i||^2 + ||q||^2`, so the PE only adds `-2 * dot(D_i, q)`. The dominant loop is distance accumulation, `O(rows_per_pe * d_dim)`: each feature uses one vector `@fmacs` over local rows. The first FMAC starts from `D_norms`, so there is no initialization sweep. When `d_dim` is divisible by 8, host packing makes the DSD stride 8 as I found that to be optimal through experimentation.
 
 Dominant-loop estimate:
 

@@ -1,6 +1,6 @@
 **Challenge start time:** 9:38 PM EST, April 28, 2026
 
-**Finish time:** 7:20 PM EST, May 1, 2026
+**Finish time:** 7:30 PM EST, May 1, 2026
 
 # Cerebras Kernel Challenge — Top-K k-NN
 
