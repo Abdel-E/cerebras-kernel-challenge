@@ -9,7 +9,6 @@ param P: u16;
 param d_dim: u16;
 param rows_per_pe: u16;
 param K: u16;
-param D_block: u16;
 
 const memcpy = @import_module("<memcpy/get_params>", .{
   .width = P,
@@ -40,8 +39,7 @@ layout {
         .P = P,
         .d_dim = d_dim,
         .rows_per_pe = rows_per_pe,
-        .K = K,
-        .D_block = D_block
+        .K = K
       });
     }
   }

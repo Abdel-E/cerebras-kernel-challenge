@@ -18,7 +18,7 @@ from cerebras.sdk.runtime.sdkruntimepybind import MemcpyDataType  # pylint: disa
 from cerebras.sdk.runtime.sdkruntimepybind import MemcpyOrder  # pylint: disable=no-name-in-module
 from cerebras.sdk.runtime.sdkruntimepybind import SdkRuntime  # pylint: disable=no-name-in-module
 
-from reference import ALL_CASES
+from reference import ALL_CASES, topk_reference
 
 
 CASE_KEYS = (
@@ -57,7 +57,7 @@ def load_case(case_key: str) -> tuple[dict[str, Any], np.ndarray, np.ndarray]:
 
 def read_compile_params(
     name: str, case: dict[str, Any], D_source: np.ndarray
-) -> tuple[int, int, int, int, int]:
+) -> tuple[int, int, int, int]:
     with open(Path(name) / "out.json", encoding="utf-8") as json_file:
         compile_data = json.load(json_file)
 
@@ -65,12 +65,11 @@ def read_compile_params(
     d_dim = int(compile_data["params"]["d_dim"])
     rows_per_pe = int(compile_data["params"]["rows_per_pe"])
     K = int(compile_data["params"]["K"])
-    D_block = int(compile_data["params"].get("D_block", 4))
     if P != case["P"] or K != case["K"] or d_dim != D_source.shape[1]:
         raise SystemExit(
             f"Compile params P={P}, d_dim={d_dim}, K={K} do not match case '{case['name']}'"
         )
-    return P, d_dim, rows_per_pe, K, D_block
+    return P, d_dim, rows_per_pe, K
 
 
 def pack_inputs(
@@ -79,8 +78,8 @@ def pack_inputs(
     P: int,
     d_dim: int,
     rows_per_pe: int,
-    D_block: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    D_block = 8
     num_pes = P * P
     N = D_source.shape[0]
     q_norm = np.einsum("i,i->", q, q).astype(np.float32)
@@ -95,10 +94,7 @@ def pack_inputs(
 
     # PE linear order matches the device index formula:
     # global_index = (py * P + px) * rows_per_pe + local_row.
-    if d_dim % D_block != 0:
-        raise SystemExit(
-            f"Blocked D layout requires d_dim multiple of {D_block}, got d_dim={d_dim}"
-        )
+    use_blocked_layout = (d_dim % D_block) == 0
 
     for pe_linear in range(num_pes):
         py, px = divmod(pe_linear, P)
@@ -108,13 +104,18 @@ def pack_inputs(
         if valid:
             shard_rows = np.zeros((rows_per_pe, d_dim), dtype=np.float32)
             shard_rows[:valid, :] = D_source[start:end]
-            blocks = d_dim // D_block
-            blocked = (
-                shard_rows.reshape(rows_per_pe, blocks, D_block)
-                .transpose(1, 0, 2)
-                .reshape(rows_per_pe, d_dim)
-            )
-            D_packed[py, px, :, :] = blocked
+            if use_blocked_layout:
+                blocks = d_dim // D_block
+                blocked = (
+                    shard_rows.reshape(rows_per_pe, blocks, D_block)
+                    .transpose(1, 0, 2)
+                    .reshape(rows_per_pe, d_dim)
+                )
+                D_packed[py, px, :, :] = blocked
+            else:
+                # Keep row-major packing so pe_program.csl's non-blocked DSD
+                # fallback can handle dimensions that are not multiples of 8.
+                D_packed[py, px, :, :] = shard_rows
             D_norms_packed[py, px, :valid] = D_norms_source[start:end]
         valid_counts[py, px, 0] = valid
 
@@ -124,13 +125,10 @@ def pack_inputs(
 def compute_expected(
     D_source: np.ndarray, q: np.ndarray, K: int
 ) -> tuple[np.ndarray, np.ndarray]:
-    # Keep the comparison oracle local to this runner so it uses the same
-    # float32 distance path and lexicographic tie-break as the device.
-    diff = D_source - q[None, :]
-    all_distances = np.einsum("ij,ij->i", diff, diff).astype(np.float32)
-    all_indices = np.arange(D_source.shape[0], dtype=np.uint32)
-    order = np.lexsort((all_indices.astype(np.int64), all_distances))
-    return all_distances[order[:K]], all_indices[order[:K]]
+    # Delegate to the challenge oracle so the runner validates exactly the same
+    # squared-L2 distances and tie-breaking rule described in reference.py.
+    expected_indices, expected_distances = topk_reference(D_source, q, K)
+    return expected_distances, expected_indices
 
 
 def memcpy_h2d_32(
@@ -258,7 +256,7 @@ def main() -> int:
         "indices": runner.get_id("indices"),
     }
 
-    P, d_dim, rows_per_pe, K, D_block = read_compile_params(args.name, case, D_source)
+    P, d_dim, rows_per_pe, K = read_compile_params(args.name, case, D_source)
 
     print("Loading and starting device program...", flush=True)
     runner.load()
@@ -266,7 +264,7 @@ def main() -> int:
 
     print("Packing D shards...", flush=True)
     D_packed, D_norms_packed, valid_counts = pack_inputs(
-        D_source, q, P, d_dim, rows_per_pe, D_block
+        D_source, q, P, d_dim, rows_per_pe
     )
     expected_distances, expected_indices = compute_expected(D_source, q, K)
 

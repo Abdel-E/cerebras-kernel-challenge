@@ -17,7 +17,6 @@ param P: u16;
 param d_dim: u16;
 param rows_per_pe: u16;
 param K: u16;
-param D_block: u16;
 
 const bcast_q_down_task_id: local_task_id = @get_local_task_id(6);
 const compute_task_id:      local_task_id = @get_local_task_id(7);
@@ -33,9 +32,12 @@ const mpi_y = @import_module("<collectives_2d/pe>", .{ .dim_params = c2d_params.
 const D_LEN: u16 = rows_per_pe * d_dim;
 const rows_per_pe_i16: i16 = @as(i16, rows_per_pe);
 const d_dim_i16: i16 = @as(i16, d_dim);
-const D_BLOCK: u16 = D_block;
+// Host and PE agree on this block width. For dimensions divisible by 8, run.py
+// packs D as [feature_block][row][feature_in_block], reducing the DSD stride
+// during distance accumulation from d_dim to 8. Non-multiples use row-major
+// packing and the fallback D_col_dsd path.
+const D_BLOCK: u16 = 8;
 const D_BLOCK_I16: i16 = @as(i16, D_BLOCK);
-const USE_BLOCKED_D_LAYOUT: bool = true;
 const BASELINE_K: u16 = 16;
 const SORT_STREAMS_WHEN_FULL_K: bool = true;
 const INF: f32 = 1.0e30;
@@ -104,6 +106,30 @@ fn init_local_topk() void {
   }
 }
 
+fn local_valid_rows() u16 {
+  // `valid_count` is host-provided to mask padding on uneven shards.
+  var valid_rows: u16 = rows_per_pe;
+  if (valid_count[0] < @as(u32, rows_per_pe)) {
+    valid_rows = @as(u16, valid_count[0]);
+  }
+  return valid_rows;
+}
+
+// k_large has K == rows_per_pe. Sorting locally costs extra work, but it lets
+// row/final reducers use linear stream merges instead of heap merging P*K
+// unsorted candidates.
+fn use_full_k_sorted_local() bool {
+  return SORT_STREAMS_WHEN_FULL_K and (K == rows_per_pe) and (K > BASELINE_K);
+}
+
+// Reducers can stream-merge only when each source already emits sorted
+// candidates. Small-K insertion paths and the full-K sorted path guarantee this.
+fn use_sorted_stream_merge() bool {
+  return (K <= BASELINE_K) or (SORT_STREAMS_WHEN_FULL_K and (K == rows_per_pe));
+}
+
+// Generic small-K insertion path used when K is below the baseline-specialized
+// size. The local buffer stays sorted, which makes later stream merges legal.
 fn insert_local(distance: f32, index: u32) void {
   var pos: i16 = @as(i16, K) - 1;
   if (!better(distance, index, local_distances[pos], local_indices[pos])) {
@@ -212,14 +238,16 @@ fn write_heap_sorted(out_distances: [*]f32, out_indices: [*]u32) void {
   }
 }
 
+// Merge P sorted K-candidate streams into one sorted K-output stream. This is
+// the main reduction primitive for small K and for locally sorted full-K cases.
 fn merge_sorted_streams(
     src_distances: [*]f32, src_indices: [*]u32,
     out_distances: [*]f32, out_indices: [*]u32) void {
   // Small-K candidates arrive as P sorted K-lists. Merge by advancing one
   // cursor per source stream instead of repeatedly rescanning the whole buffer.
   if ((P == 4) and (K == BASELINE_K)) {
-    // Baseline-specialized 4-way merge with explicit heads to avoid stream loop
-    // control overhead in the hottest reduction path.
+    // Baseline/uneven/all_equal hot path: P=4,K=16 uses an explicit 4-way
+    // merge to avoid the loop overhead of scanning an offsets array.
     var o0: u16 = 0;
     var o1: u16 = 0;
     var o2: u16 = 0;
@@ -276,8 +304,8 @@ fn merge_sorted_streams(
   }
 
   if (P == 2) {
-    // Hot path specialization: avoid generic per-output stream scan when the
-    // merge fan-in is exactly two sorted streams.
+    // All official P=2 cases reduce two sorted streams at a time. This avoids
+    // the generic loop and turns each output into one pairwise comparison.
     var offset0: u16 = 0;
     var offset1: u16 = 0;
     for (@range(u16, K)) |out_idx| {
@@ -327,6 +355,8 @@ fn merge_sorted_streams(
   }
 }
 
+// Generic reducer fallback for K > 16 when source streams are not guaranteed
+// sorted. The heap keeps only the best K while scanning P*K candidates.
 fn merge_buffer_with_heap(src_distances: [*]f32, src_indices: [*]u32,
                           out_distances: [*]f32, out_indices: [*]u32) void {
   heap_reset();
@@ -342,6 +372,7 @@ fn prepare_scaled_q() void {
   }
 }
 
+// K=16 insertion specialization avoids dynamic K casts in the baseline path.
 fn insert_local_k16(distance: f32, index: u32) void {
   var pos: i16 = 15;
   if (!better(distance, index, local_distances[pos], local_indices[pos])) {
@@ -380,11 +411,11 @@ fn seed_sort_local_k16() void {
   }
 }
 
+// Baseline-style K=16 path. Seed with the first valid rows, insertion-sort that
+// tiny seed once, then only insert later rows that beat the current threshold.
+// This is faster than heap setup/drain for the small-K cases.
 fn compute_local_topk_k16(global_base: u32) void {
-  var valid_rows: u16 = rows_per_pe;
-  if (valid_count[0] < @as(u32, rows_per_pe)) {
-    valid_rows = @as(u16, valid_count[0]);
-  }
+  const valid_rows = local_valid_rows();
 
   var seeded: u16 = BASELINE_K;
   if (valid_rows < BASELINE_K) {
@@ -412,6 +443,56 @@ fn compute_local_topk_k16(global_base: u32) void {
   }
 }
 
+// If every local row is requested and reducers do not need sorted streams,
+// selection is just a direct copy plus padding sentinels.
+fn fill_full_k_direct(global_base: u32, valid_rows: u16) void {
+  for (@range(u16, rows_per_pe)) |row| {
+    if (row < valid_rows) {
+      local_distances[row] = distance_scratch[row];
+      local_indices[row] = global_base + @as(u32, row);
+    } else {
+      local_distances[row] = INF;
+      local_indices[row] = SENTINEL_INDEX;
+    }
+  }
+}
+
+// k_large path: locally sort all rows so the distributed reduction can use
+// cheap stream merges instead of repeatedly heap-merging unsorted buffers.
+fn fill_full_k_sorted(global_base: u32, valid_rows: u16) void {
+  heap_reset();
+  for (@range(u16, rows_per_pe)) |row| {
+    if (row < valid_rows) {
+      heap_consider(distance_scratch[row], global_base + @as(u32, row));
+    } else {
+      heap_consider(INF, SENTINEL_INDEX);
+    }
+  }
+  write_heap_sorted(&local_distances, &local_indices);
+}
+
+// K=1 avoids all top-K buffer maintenance: one linear argmin pass is enough.
+fn compute_local_top1(global_base: u32, valid_rows: u16) void {
+  var best_distance: f32 = INF;
+  var best_index: u32 = SENTINEL_INDEX;
+
+  for (@range(u16, rows_per_pe)) |row| {
+    if (row < valid_rows) {
+      const distance = distance_scratch[row];
+      const global_index = global_base + @as(u32, row);
+      if (better(distance, global_index, best_distance, best_index)) {
+        best_distance = distance;
+        best_index = global_index;
+      }
+    }
+  }
+
+  local_distances[0] = best_distance;
+  local_indices[0] = best_index;
+}
+
+// Compute squared L2 as ||D||^2 + ||q||^2 - 2*D.q. The host pre-folds
+// ||q||^2 into D_norms, and the first FMAC initializes distance_scratch.
 fn compute_all_distances() void {
   // D_norms already includes ||q||^2:
   // distance_scratch[row] = D_norms[row] - 2 * dot(D_row, q).
@@ -421,7 +502,7 @@ fn compute_all_distances() void {
     return;
   }
 
-  if (USE_BLOCKED_D_LAYOUT and ((d_dim % D_BLOCK) == 0)) {
+  if ((d_dim % D_BLOCK) == 0) {
     // Blocked host packing stores D as [feature_block][row][intra_block_feature].
     // This keeps per-column row strides at D_BLOCK instead of d_dim.
     const blocks = d_dim / D_BLOCK;
@@ -432,7 +513,7 @@ fn compute_all_distances() void {
           @as(i16, block * rows_per_pe * D_BLOCK),
           f32);
       for (@range(u16, D_BLOCK)) |intra| {
-        if ((block == 0) and (intra == 0)) {
+        if (j == 0) {
           @fmacs(dist_dsd, norms_dsd, col_dsd, scaled_q[j]);
         } else {
           @fmacs(dist_dsd, dist_dsd, col_dsd, scaled_q[j]);
@@ -453,69 +534,44 @@ fn compute_all_distances() void {
   }
 }
 
+// Select the best K local candidates using the cheapest path for the current K.
 fn compute_local_topk() void {
   const pe_linear: u32 = @as(u32, py) * @as(u32, P) + @as(u32, px);
   const global_base: u32 = pe_linear * @as(u32, rows_per_pe);
+  const valid_rows = local_valid_rows();
   compute_all_distances();
 
   if (K == rows_per_pe) {
-    if (SORT_STREAMS_WHEN_FULL_K and (K > BASELINE_K)) {
-      // Optional k_large experiment: keep fully sorted local streams so row/final
-      // reducers can use the k-way stream merge path.
-      heap_reset();
-      for (@range(u16, rows_per_pe)) |row| {
-        if (@as(u32, row) < valid_count[0]) {
-          heap_consider(distance_scratch[row], global_base + @as(u32, row));
-        } else {
-          heap_consider(INF, SENTINEL_INDEX);
-        }
-      }
-      write_heap_sorted(&local_distances, &local_indices);
+    if (use_full_k_sorted_local()) {
+      fill_full_k_sorted(global_base, valid_rows);
     } else {
-      // Fast path when every local row is requested.
-      for (@range(u16, rows_per_pe)) |row| {
-        if (@as(u32, row) < valid_count[0]) {
-          local_distances[row] = distance_scratch[row];
-          local_indices[row] = global_base + @as(u32, row);
-        } else {
-          local_distances[row] = INF;
-          local_indices[row] = SENTINEL_INDEX;
-        }
-      }
+      fill_full_k_direct(global_base, valid_rows);
     }
   } else if (K == 1) {
-    var best_distance: f32 = INF;
-    var best_index: u32 = SENTINEL_INDEX;
-
-    for (@range(u16, rows_per_pe)) |row| {
-      if (@as(u32, row) < valid_count[0]) {
-        const distance = distance_scratch[row];
-        const global_index = global_base + @as(u32, row);
-        if (better(distance, global_index, best_distance, best_index)) {
-          best_distance = distance;
-          best_index = global_index;
-        }
-      }
-    }
-
-    local_distances[0] = best_distance;
-    local_indices[0] = best_index;
+    compute_local_top1(global_base, valid_rows);
   } else if (K == BASELINE_K) {
     compute_local_topk_k16(global_base);
-  } else if (K > 16) {
+  } else if (K > BASELINE_K) {
     heap_reset();
     for (@range(u16, rows_per_pe)) |row| {
-      if (@as(u32, row) < valid_count[0]) {
+      if (row < valid_rows) {
         const distance = distance_scratch[row];
         const global_index = global_base + @as(u32, row);
         heap_consider(distance, global_index);
+      }
+    }
+    if (valid_rows < K) {
+      for (@range(u16, K)) |pad| {
+        if (pad >= valid_rows) {
+          heap_consider(INF, SENTINEL_INDEX);
+        }
       }
     }
     write_heap_sorted(&local_distances, &local_indices);
   } else {
     init_local_topk();
     for (@range(u16, rows_per_pe)) |row| {
-      if (@as(u32, row) < valid_count[0]) {
+      if (row < valid_rows) {
         const distance = distance_scratch[row];
         const global_index = global_base + @as(u32, row);
         insert_local(distance, global_index);
@@ -527,7 +583,7 @@ fn compute_local_topk() void {
 fn merge_global_topk() void {
   // Small cases avoid heap overhead; large K uses a fixed-size max-heap to
   // avoid insertion shifts in the merge buffers.
-  if ((K <= BASELINE_K) or (SORT_STREAMS_WHEN_FULL_K and (K == rows_per_pe))) {
+  if (use_sorted_stream_merge()) {
     merge_sorted_streams(&all_distances, &all_indices,
                          &final_distances, &final_indices);
   } else {
@@ -538,7 +594,7 @@ fn merge_global_topk() void {
 
 fn merge_row_topk() void {
   // Row roots use the same policy as the final root.
-  if ((K <= BASELINE_K) or (SORT_STREAMS_WHEN_FULL_K and (K == rows_per_pe))) {
+  if (use_sorted_stream_merge()) {
     merge_sorted_streams(&row_distances, &row_indices,
                          &row_top_distances, &row_top_indices);
   } else {
