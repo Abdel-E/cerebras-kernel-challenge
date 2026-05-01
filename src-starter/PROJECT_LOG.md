@@ -316,6 +316,64 @@ The new full-K option changes that critical path:
 Net effect in this environment: `k_large` fell from the previously logged
 `712258` to `325746` cycles in the latest run configuration.
 
+### 9) Additional math/communication experiments (current pass)
+
+- **`P=4, K=16` fixed merge-tree specialization: rejected**
+  - Added a baseline-only merge tree (`(0,1)`, `(2,3)`, then final merge) inside
+    `merge_sorted_streams()` to reduce generic per-output stream-scan overhead.
+  - Correctness passed on baseline, but performance regressed:
+    - baseline: `118303` cycles (`out/baseline_p4k16_tree`)
+  - Reverted after measurement.
+
+- **DSD fused initialization + first FMAC: kept**
+  - Updated `compute_all_distances()` to fuse
+    `distance_scratch[:] = D_norms[:]` with the first column FMAC:
+    - old: one full `@fadds` pass + `d_dim` FMAC passes
+    - new: first FMAC reads `norms_dsd` directly, then `d_dim-1` FMAC passes
+  - Added safe `d_dim == 0` fallback.
+  - Validation:
+    - baseline `PASS`: `111473` cycles (`out/baseline_fused_scaled`)
+    - uneven `PASS`: `66828` cycles (`out/uneven_fused_scaled`)
+    - k_large compile-check passed: `out/k_large_fused_scaled`
+  - Compared to the latest sweep references in this log:
+    - baseline: `111561 -> 111473` (**-88**)
+    - uneven: `66886 -> 66828` (**-58**)
+
+- **Queued y-gather overlap attempt: rejected**
+  - Tried issuing both column gathers (distances + indices) from the same row-root
+    callback to reduce callback scheduling gaps.
+  - Baseline correctness failed (all-zero final distances in host check), so the
+    change was reverted immediately.
+  - Post-revert sanity run:
+    - baseline `PASS`: `111472` (`out/baseline_fused_scaled`)
+
+### 10) Blocked DSD layout experiment (`B=4`)
+
+- **What changed (kept, experimental)**
+  - Host packing in `run.py` now supports a blocked PE-local layout for `D`
+    (`USE_BLOCKED_D_LAYOUT = True`, `D_BLOCK = 4`):
+    - logical storage per PE becomes `[feature_block][row][intra_block_feature]`
+    - flattened back into the same symbol shape/size (`rows_per_pe * d_dim`)
+  - Device `compute_all_distances()` added a blocked DSD path:
+    - uses `D_block_col_dsd` with stride `D_BLOCK`
+    - loops by feature block, then intra-block feature
+    - keeps fused-init behavior (`norms_dsd` fused with first FMAC)
+    - falls back to the prior row-major path if `d_dim % D_BLOCK != 0`
+
+- **Why this helps**
+  - For blocked path, per-column row stride becomes `D_BLOCK` instead of `d_dim`.
+  - This reduces address-jump distance in the streamed FMAC loop while preserving
+    exact distance math and deterministic ordering.
+
+- **Validation + measured deltas**
+  - `baseline` `PASS`: `110732` (`out/baseline_blocked_dsd4`)
+  - `uneven` `PASS`: `66395` (`out/uneven_blocked_dsd4`)
+  - `k_large` `PASS`: `318238` (`out/k_large_blocked_dsd4`)
+  - Versus latest references in this log:
+    - baseline: `111561 -> 110732` (**-829**, ~**-0.74%**)
+    - uneven: `66886 -> 66395` (**-491**, ~**-0.73%**)
+    - k_large: `318377 -> 318238` (**-139**, small win)
+
 ### Known issues / recurring pain points
 
 - **“Hang” on `memcpy_d2h`**: usually the device pipeline is just still running

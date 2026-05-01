@@ -32,6 +32,9 @@ const mpi_y = @import_module("<collectives_2d/pe>", .{ .dim_params = c2d_params.
 const D_LEN: u16 = rows_per_pe * d_dim;
 const rows_per_pe_i16: i16 = @as(i16, rows_per_pe);
 const d_dim_i16: i16 = @as(i16, d_dim);
+const D_BLOCK: u16 = 4;
+const D_BLOCK_I16: i16 = @as(i16, D_BLOCK);
+const USE_BLOCKED_D_LAYOUT: bool = true;
 const BASELINE_K: u16 = 16;
 const SORT_STREAMS_WHEN_FULL_K: bool = true;
 const INF: f32 = 1.0e30;
@@ -65,6 +68,7 @@ const ptr_final_distances: [*]f32 = &final_distances;
 const ptr_final_indices: [*]u32 = &final_indices;
 
 var D_col_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{rows_per_pe_i16} -> D[i * d_dim_i16] });
+var D_block_col_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{rows_per_pe_i16} -> D[i * D_BLOCK_I16] });
 var norms_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &D_norms, .extent = rows_per_pe });
 var dist_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &distance_scratch, .extent = rows_per_pe });
 
@@ -352,11 +356,40 @@ fn compute_local_topk_k16(global_base: u32) void {
 fn compute_all_distances() void {
   // D_norms already includes ||q||^2:
   // distance_scratch[row] = D_norms[row] - 2 * dot(D_row, q).
-  // D is row-major, so each loop iteration streams one strided column DSD.
-  @fadds(dist_dsd, norms_dsd, 0.0);
-  var col_dsd = D_col_dsd;
-  for (@range(u16, d_dim)) |j| {
-    @fmacs(dist_dsd, dist_dsd, col_dsd, scaled_q[j]);
+  // Fuse initialization with the first FMAC to remove one full vector sweep.
+  if (d_dim == 0) {
+    @fadds(dist_dsd, norms_dsd, 0.0);
+    return;
+  }
+
+  if (USE_BLOCKED_D_LAYOUT and ((d_dim % D_BLOCK) == 0)) {
+    // Blocked host packing stores D as [feature_block][row][intra_block_feature].
+    // This keeps per-column row strides at D_BLOCK instead of d_dim.
+    const blocks = d_dim / D_BLOCK;
+    var j: u16 = 0;
+    for (@range(u16, blocks)) |block| {
+      var col_dsd = @increment_dsd_offset(
+          D_block_col_dsd,
+          @as(i16, block * rows_per_pe * D_BLOCK),
+          f32);
+      for (@range(u16, D_BLOCK)) |intra| {
+        if ((block == 0) and (intra == 0)) {
+          @fmacs(dist_dsd, norms_dsd, col_dsd, scaled_q[j]);
+        } else {
+          @fmacs(dist_dsd, dist_dsd, col_dsd, scaled_q[j]);
+        }
+        col_dsd = @increment_dsd_offset(col_dsd, 1, f32);
+        j += 1;
+      }
+    }
+    return;
+  }
+
+  // Fallback path for non-block-aligned d_dim.
+  @fmacs(dist_dsd, norms_dsd, D_col_dsd, scaled_q[0]);
+  var col_dsd = @increment_dsd_offset(D_col_dsd, 1, f32);
+  for (@range(u16, d_dim - 1)) |j| {
+    @fmacs(dist_dsd, dist_dsd, col_dsd, scaled_q[j + 1]);
     col_dsd = @increment_dsd_offset(col_dsd, 1, f32);
   }
 }

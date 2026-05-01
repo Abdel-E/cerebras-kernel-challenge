@@ -30,6 +30,9 @@ CASE_KEYS = (
     "duplicates",
 )
 
+D_BLOCK = 4
+USE_BLOCKED_D_LAYOUT = True
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -93,13 +96,29 @@ def pack_inputs(
 
     # PE linear order matches the device index formula:
     # global_index = (py * P + px) * rows_per_pe + local_row.
+    if USE_BLOCKED_D_LAYOUT and d_dim % D_BLOCK != 0:
+        raise SystemExit(
+            f"Blocked D layout requires d_dim multiple of {D_BLOCK}, got d_dim={d_dim}"
+        )
+
     for pe_linear in range(num_pes):
         py, px = divmod(pe_linear, P)
         start = pe_linear * rows_per_pe
         end = min(start + rows_per_pe, N)
         valid = max(0, end - start)
         if valid:
-            D_packed[py, px, :valid, :] = D_source[start:end]
+            shard_rows = np.zeros((rows_per_pe, d_dim), dtype=np.float32)
+            shard_rows[:valid, :] = D_source[start:end]
+            if USE_BLOCKED_D_LAYOUT:
+                blocks = d_dim // D_BLOCK
+                blocked = (
+                    shard_rows.reshape(rows_per_pe, blocks, D_BLOCK)
+                    .transpose(1, 0, 2)
+                    .reshape(rows_per_pe, d_dim)
+                )
+                D_packed[py, px, :, :] = blocked
+            else:
+                D_packed[py, px, :, :] = shard_rows
             D_norms_packed[py, px, :valid] = D_norms_source[start:end]
         valid_counts[py, px, 0] = valid
 
