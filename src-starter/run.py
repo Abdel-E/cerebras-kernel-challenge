@@ -14,12 +14,11 @@ from typing import Any
 
 import numpy as np
 
-from cerebras.sdk.runtime.sdkruntimepybind import MemcpyDataType  # pylint: disable=no-name-in-module
-from cerebras.sdk.runtime.sdkruntimepybind import MemcpyOrder  # pylint: disable=no-name-in-module
-from cerebras.sdk.runtime.sdkruntimepybind import SdkRuntime  # pylint: disable=no-name-in-module
+from cerebras.sdk.runtime.sdkruntimepybind import MemcpyDataType 
+from cerebras.sdk.runtime.sdkruntimepybind import MemcpyOrder
+from cerebras.sdk.runtime.sdkruntimepybind import SdkRuntime 
 
 from reference import ALL_CASES, topk_reference
-
 
 CASE_KEYS = (
     "baseline",
@@ -29,7 +28,6 @@ CASE_KEYS = (
     "all_equal",
     "duplicates",
 )
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -42,7 +40,6 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
-
 def load_case(case_key: str) -> tuple[dict[str, Any], np.ndarray, np.ndarray]:
     cases = {key: maker() for key, maker in zip(CASE_KEYS, ALL_CASES)}
     if case_key not in cases:
@@ -53,7 +50,6 @@ def load_case(case_key: str) -> tuple[dict[str, Any], np.ndarray, np.ndarray]:
     D_source = np.asarray(case["D"], dtype=np.float32)
     q = np.asarray(case["q"], dtype=np.float32)
     return case, D_source, q
-
 
 def read_compile_params(
     name: str, case: dict[str, Any], D_source: np.ndarray
@@ -71,7 +67,6 @@ def read_compile_params(
         )
     return P, d_dim, rows_per_pe, K
 
-
 def pack_inputs(
     D_source: np.ndarray,
     q: np.ndarray,
@@ -83,8 +78,8 @@ def pack_inputs(
     num_pes = P * P
     N = D_source.shape[0]
     q_norm = np.einsum("i,i->", q, q).astype(np.float32)
-    # Fold ||q||^2 into the packed row norms. This removes the repeated PE-side
-    # q dot product without increasing the query broadcast payload.
+    # Fold ||q||^2 into the packed row norms. This removes repeated PE-side
+    # q-norm work without increasing the query broadcast payload.
     D_norms_source = (
         np.einsum("ij,ij->i", D_source, D_source).astype(np.float32) + q_norm
     )
@@ -130,7 +125,6 @@ def compute_expected(
     expected_indices, expected_distances = topk_reference(D_source, q, K)
     return expected_distances, expected_indices
 
-
 def memcpy_h2d_32(
     runner: SdkRuntime,
     symbol: int,
@@ -154,7 +148,6 @@ def memcpy_h2d_32(
         order=MemcpyOrder.ROW_MAJOR,
         nonblock=False,
     )
-
 
 def memcpy_d2h_32(
     runner: SdkRuntime,
@@ -180,7 +173,6 @@ def memcpy_d2h_32(
         nonblock=False,
     )
 
-
 def copy_inputs(
     runner: SdkRuntime,
     symbols: dict[str, int],
@@ -201,7 +193,6 @@ def copy_inputs(
     print("Copying q to root H2D...", flush=True)
     memcpy_h2d_32(runner, symbols["q"], q, 0, 0, 1, 1, d_dim)
 
-
 def read_outputs(
     runner: SdkRuntime, symbols: dict[str, int], K: int
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -213,7 +204,6 @@ def read_outputs(
     print("Reading final indices D2H...", flush=True)
     memcpy_d2h_32(runner, indices, symbols["indices"], 0, 0, 1, 1, K)
     return distances, indices
-
 
 def snapshot_sim_stats(case_key: str, build_name: str, stats_dir: str | None) -> None:
     if not stats_dir:
@@ -237,7 +227,6 @@ def snapshot_sim_stats(case_key: str, build_name: str, stats_dir: str | None) ->
         json.dump(stats, outfile, indent=2, sort_keys=True)
         outfile.write("\n")
     print(f"Saved sim stats snapshot: {output_path}", flush=True)
-
 
 def main() -> int:
     args = parse_args()
@@ -283,7 +272,6 @@ def main() -> int:
     np.testing.assert_array_equal(indices.astype(np.int32), expected_indices)
     print(f"PASS: {args.case}")
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

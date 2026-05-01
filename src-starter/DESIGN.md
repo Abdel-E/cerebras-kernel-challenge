@@ -1,7 +1,7 @@
 # DESIGN
 
-Start time: 9:38 PM EST, April 28, 2026
-Finish time: 6:45 PM EST, May 1, 2026
+Start time: 9:38 PM EST, April 28, 2026  
+Finish time: 7:15 PM EST, May 1, 2026
 
 ## Routing Topology
 
@@ -9,11 +9,11 @@ The kernel runs on a `P x P` PE rectangle. PE `(px, py)` owns rows starting at `
 
 The host copies `D`, `D_norms`, and `valid_count` to **every** PE. `valid_count` masks padding rows. The host copies `q` **only** to PE `(0,0)`. The device broadcasts `q` across the top row on x colors `0/1`, then down each column on y colors `4/5` using `collectives_2d`.
 
-![Query broadcast topology](query_broadcast.png)
+Query broadcast topology
 
 After compute, each row gathers local top-K Westward to the row root at `px=0`, which merges `P*K` candidates to K row winners. Column 0 then gathers row winners Northward to PE `(0,0)` for the final top-K.
 
-![Two-stage top-K reduction topology](topk_reduction.png)
+Two-stage top-K reduction topology
 
 The x entrypoints are task IDs `10/11`; y entrypoints are `12/13`. Query wavelets carry `q`; candidate wavelets carry one distance or one index. I keep distance and index gathers separate because fusing them pressured SRAM on `k_large`.
 

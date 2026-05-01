@@ -149,6 +149,7 @@ fn insert_local(distance: f32, index: u32) void {
   local_indices[pos] = index;
 }
 
+// Heap helpers for large K cases.
 fn heap_swap(a: u16, b: u16) void {
   const tmp_dist = heap_distances[a];
   const tmp_idx = heap_indices[a];
@@ -581,8 +582,8 @@ fn compute_local_topk() void {
 }
 
 fn merge_global_topk() void {
-  // Small cases avoid heap overhead; large K uses a fixed-size max-heap to
-  // avoid insertion shifts in the merge buffers.
+  // Use stream merge whenever sources are already sorted; fall back to a
+  // fixed-size max-heap only for unsorted larger-K merge buffers.
   if (use_sorted_stream_merge()) {
     merge_sorted_streams(&all_distances, &all_indices,
                          &final_distances, &final_indices);
@@ -593,7 +594,7 @@ fn merge_global_topk() void {
 }
 
 fn merge_row_topk() void {
-  // Row roots use the same policy as the final root.
+  // Row roots use the same sorted-stream/heap policy as the final root.
   if (use_sorted_stream_merge()) {
     merge_sorted_streams(&row_distances, &row_indices,
                          &row_top_distances, &row_top_indices);
