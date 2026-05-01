@@ -1,7 +1,7 @@
 # DESIGN
 
 Start time: 9:38 PM EST, April 28, 2026  
-Finish time: 7:30 PM EST, May 1, 2026
+Finish time: 7:45 PM EST, May 1, 2026
 
 ## Routing Topology
 
