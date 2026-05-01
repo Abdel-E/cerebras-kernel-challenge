@@ -374,6 +374,30 @@ Net effect in this environment: `k_large` fell from the previously logged
     - uneven: `66886 -> 66395` (**-491**, ~**-0.73%**)
     - k_large: `318377 -> 318238` (**-139**, small win)
 
+### 11) Block-size sweep + `P=4,K=16` merge micro-kernel
+
+- **Blocked layout sweep (`d_dim=32` baseline)**
+  - `D_block=2`: `111397`
+  - `D_block=4`: `110731`
+  - `D_block=8`: `110403` (**best**)
+  - `D_block=16`: `111177`
+  - Winner for this workload: `D_block=8`.
+
+- **Cross-case check with `D_block=8`**
+  - `uneven`: `66067` (`out/uneven_block8`)
+  - `k_large`: `318235` (`out/k_large_block8`)
+  - Both passed correctness.
+
+- **`P=4,K=16` merge micro-kernel on top of `D_block=8` (kept)**
+  - Added an explicit 4-head merge path in `merge_sorted_streams()` for the
+    fixed baseline shape to reduce generic stream-loop overhead.
+  - Results:
+    - `baseline`: `110224` (`out/baseline_block8_mergek16`)
+    - `uneven`: `65885` (`out/uneven_block8_mergek16`)
+  - Versus the immediate `D_block=8` results:
+    - baseline: `110403 -> 110224` (**-179**)
+    - uneven: `66067 -> 65885` (**-182**)
+
 ### Known issues / recurring pain points
 
 - **“Hang” on `memcpy_d2h`**: usually the device pipeline is just still running

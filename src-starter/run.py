@@ -30,9 +30,6 @@ CASE_KEYS = (
     "duplicates",
 )
 
-D_BLOCK = 4
-USE_BLOCKED_D_LAYOUT = True
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -60,7 +57,7 @@ def load_case(case_key: str) -> tuple[dict[str, Any], np.ndarray, np.ndarray]:
 
 def read_compile_params(
     name: str, case: dict[str, Any], D_source: np.ndarray
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int, int, int]:
     with open(Path(name) / "out.json", encoding="utf-8") as json_file:
         compile_data = json.load(json_file)
 
@@ -68,11 +65,12 @@ def read_compile_params(
     d_dim = int(compile_data["params"]["d_dim"])
     rows_per_pe = int(compile_data["params"]["rows_per_pe"])
     K = int(compile_data["params"]["K"])
+    D_block = int(compile_data["params"].get("D_block", 4))
     if P != case["P"] or K != case["K"] or d_dim != D_source.shape[1]:
         raise SystemExit(
             f"Compile params P={P}, d_dim={d_dim}, K={K} do not match case '{case['name']}'"
         )
-    return P, d_dim, rows_per_pe, K
+    return P, d_dim, rows_per_pe, K, D_block
 
 
 def pack_inputs(
@@ -81,6 +79,7 @@ def pack_inputs(
     P: int,
     d_dim: int,
     rows_per_pe: int,
+    D_block: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     num_pes = P * P
     N = D_source.shape[0]
@@ -96,9 +95,9 @@ def pack_inputs(
 
     # PE linear order matches the device index formula:
     # global_index = (py * P + px) * rows_per_pe + local_row.
-    if USE_BLOCKED_D_LAYOUT and d_dim % D_BLOCK != 0:
+    if d_dim % D_block != 0:
         raise SystemExit(
-            f"Blocked D layout requires d_dim multiple of {D_BLOCK}, got d_dim={d_dim}"
+            f"Blocked D layout requires d_dim multiple of {D_block}, got d_dim={d_dim}"
         )
 
     for pe_linear in range(num_pes):
@@ -109,16 +108,13 @@ def pack_inputs(
         if valid:
             shard_rows = np.zeros((rows_per_pe, d_dim), dtype=np.float32)
             shard_rows[:valid, :] = D_source[start:end]
-            if USE_BLOCKED_D_LAYOUT:
-                blocks = d_dim // D_BLOCK
-                blocked = (
-                    shard_rows.reshape(rows_per_pe, blocks, D_BLOCK)
-                    .transpose(1, 0, 2)
-                    .reshape(rows_per_pe, d_dim)
-                )
-                D_packed[py, px, :, :] = blocked
-            else:
-                D_packed[py, px, :, :] = shard_rows
+            blocks = d_dim // D_block
+            blocked = (
+                shard_rows.reshape(rows_per_pe, blocks, D_block)
+                .transpose(1, 0, 2)
+                .reshape(rows_per_pe, d_dim)
+            )
+            D_packed[py, px, :, :] = blocked
             D_norms_packed[py, px, :valid] = D_norms_source[start:end]
         valid_counts[py, px, 0] = valid
 
@@ -262,7 +258,7 @@ def main() -> int:
         "indices": runner.get_id("indices"),
     }
 
-    P, d_dim, rows_per_pe, K = read_compile_params(args.name, case, D_source)
+    P, d_dim, rows_per_pe, K, D_block = read_compile_params(args.name, case, D_source)
 
     print("Loading and starting device program...", flush=True)
     runner.load()
@@ -270,7 +266,7 @@ def main() -> int:
 
     print("Packing D shards...", flush=True)
     D_packed, D_norms_packed, valid_counts = pack_inputs(
-        D_source, q, P, d_dim, rows_per_pe
+        D_source, q, P, d_dim, rows_per_pe, D_block
     )
     expected_distances, expected_indices = compute_expected(D_source, q, K)
 

@@ -17,6 +17,7 @@ param P: u16;
 param d_dim: u16;
 param rows_per_pe: u16;
 param K: u16;
+param D_block: u16;
 
 const bcast_q_down_task_id: local_task_id = @get_local_task_id(6);
 const compute_task_id:      local_task_id = @get_local_task_id(7);
@@ -32,7 +33,7 @@ const mpi_y = @import_module("<collectives_2d/pe>", .{ .dim_params = c2d_params.
 const D_LEN: u16 = rows_per_pe * d_dim;
 const rows_per_pe_i16: i16 = @as(i16, rows_per_pe);
 const d_dim_i16: i16 = @as(i16, d_dim);
-const D_BLOCK: u16 = 4;
+const D_BLOCK: u16 = D_block;
 const D_BLOCK_I16: i16 = @as(i16, D_BLOCK);
 const USE_BLOCKED_D_LAYOUT: bool = true;
 const BASELINE_K: u16 = 16;
@@ -216,6 +217,64 @@ fn merge_sorted_streams(
     out_distances: [*]f32, out_indices: [*]u32) void {
   // Small-K candidates arrive as P sorted K-lists. Merge by advancing one
   // cursor per source stream instead of repeatedly rescanning the whole buffer.
+  if ((P == 4) and (K == BASELINE_K)) {
+    // Baseline-specialized 4-way merge with explicit heads to avoid stream loop
+    // control overhead in the hottest reduction path.
+    var o0: u16 = 0;
+    var o1: u16 = 0;
+    var o2: u16 = 0;
+    var o3: u16 = 0;
+    for (@range(u16, BASELINE_K)) |out_idx| {
+      var best_stream: u16 = 0;
+      var best_distance: f32 = INF;
+      var best_index: u32 = SENTINEL_INDEX;
+
+      if (o0 < BASELINE_K) {
+        best_stream = 0;
+        best_distance = src_distances[o0];
+        best_index = src_indices[o0];
+      }
+      if (o1 < BASELINE_K) {
+        const p1 = BASELINE_K + o1;
+        if (better(src_distances[p1], src_indices[p1], best_distance, best_index)) {
+          best_stream = 1;
+          best_distance = src_distances[p1];
+          best_index = src_indices[p1];
+        }
+      }
+      if (o2 < BASELINE_K) {
+        const p2 = 2 * BASELINE_K + o2;
+        if (better(src_distances[p2], src_indices[p2], best_distance, best_index)) {
+          best_stream = 2;
+          best_distance = src_distances[p2];
+          best_index = src_indices[p2];
+        }
+      }
+      if (o3 < BASELINE_K) {
+        const p3 = 3 * BASELINE_K + o3;
+        if (better(src_distances[p3], src_indices[p3], best_distance, best_index)) {
+          best_stream = 3;
+          best_distance = src_distances[p3];
+          best_index = src_indices[p3];
+        }
+      }
+
+      out_distances[out_idx] = best_distance;
+      out_indices[out_idx] = best_index;
+
+      if (best_stream == 0) {
+        o0 += 1;
+      } else if (best_stream == 1) {
+        o1 += 1;
+      } else if (best_stream == 2) {
+        o2 += 1;
+      } else {
+        o3 += 1;
+      }
+    }
+    return;
+  }
+
   if (P == 2) {
     // Hot path specialization: avoid generic per-output stream scan when the
     // merge fan-in is exactly two sorted streams.
