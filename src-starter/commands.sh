@@ -13,4 +13,4 @@ cslc --arch=wse2 layout.csl \
   --memcpy --channels=1 \
   -o out/baseline
 
-cs_python run.py --name out/baseline --case baseline --stats-dir out/stats
+cs_python run.py --name out/baseline --case baseline

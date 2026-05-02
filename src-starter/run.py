@@ -34,10 +34,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--name", required=True, help="Compiled output directory")
     parser.add_argument("--case", required=True, help="Reference test case name")
     parser.add_argument("--cmaddr", help="IP:port for CS system")
-    parser.add_argument(
-        "--stats-dir",
-        help="Optional directory to store per-case sim_stats snapshots",
-    )
     return parser.parse_args()
 
 def load_case(case_key: str) -> tuple[dict[str, Any], np.ndarray, np.ndarray]:
@@ -184,13 +180,9 @@ def copy_inputs(
     d_dim: int,
     rows_per_pe: int,
 ) -> None:
-    print("Copying D shards H2D...", flush=True)
     memcpy_h2d_32(runner, symbols["D"], D_packed, 0, 0, P, P, rows_per_pe * d_dim)
-    print("Copying D norms H2D...", flush=True)
     memcpy_h2d_32(runner, symbols["D_norms"], D_norms_packed, 0, 0, P, P, rows_per_pe)
-    print("Copying valid_count H2D...", flush=True)
     memcpy_h2d_32(runner, symbols["valid_count"], valid_counts, 0, 0, P, P, 1)
-    print("Copying q to root H2D...", flush=True)
     memcpy_h2d_32(runner, symbols["q"], q, 0, 0, 1, 1, d_dim)
 
 def read_outputs(
@@ -199,42 +191,15 @@ def read_outputs(
     distances = np.zeros(K, dtype=np.float32)
     indices = np.zeros(K, dtype=np.uint32)
 
-    print("Reading final distances D2H...", flush=True)
     memcpy_d2h_32(runner, distances, symbols["distances"], 0, 0, 1, 1, K)
-    print("Reading final indices D2H...", flush=True)
     memcpy_d2h_32(runner, indices, symbols["indices"], 0, 0, 1, 1, K)
     return distances, indices
-
-def snapshot_sim_stats(case_key: str, build_name: str, stats_dir: str | None) -> None:
-    if not stats_dir:
-        return
-
-    source = Path("sim_stats.json")
-    if not source.exists():
-        print("sim_stats.json not found; skipping stats snapshot.", flush=True)
-        return
-
-    with open(source, encoding="utf-8") as infile:
-        stats = json.load(infile)
-
-    stats["_case"] = case_key
-    stats["_build"] = build_name
-
-    output_dir = Path(stats_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"{case_key}.json"
-    with open(output_path, "w", encoding="utf-8") as outfile:
-        json.dump(stats, outfile, indent=2, sort_keys=True)
-        outfile.write("\n")
-    print(f"Saved sim stats snapshot: {output_path}", flush=True)
 
 def main() -> int:
     args = parse_args()
 
-    print(f"Loading case {args.case}...", flush=True)
     case, D_source, q = load_case(args.case)
 
-    print("Setting up runtime...", flush=True)
     runner = SdkRuntime(args.name, cmaddr=args.cmaddr)
     symbols = {
         "D": runner.get_id("D"),
@@ -247,11 +212,9 @@ def main() -> int:
 
     P, d_dim, rows_per_pe, K = read_compile_params(args.name, case, D_source)
 
-    print("Loading and starting device program...", flush=True)
     runner.load()
     runner.run()
 
-    print("Packing D shards...", flush=True)
     D_packed, D_norms_packed, valid_counts = pack_inputs(
         D_source, q, P, d_dim, rows_per_pe
     )
@@ -260,14 +223,11 @@ def main() -> int:
     copy_inputs(
         runner, symbols, D_packed, D_norms_packed, valid_counts, q, P, d_dim, rows_per_pe
     )
-    print("Launching main...", flush=True)
     runner.launch("main", nonblock=False)
 
     distances, indices = read_outputs(runner, symbols, K)
     runner.stop()
-    snapshot_sim_stats(args.case, args.name, args.stats_dir)
 
-    print("Comparing against reference...", flush=True)
     np.testing.assert_allclose(distances, expected_distances, atol=1e-3, rtol=1e-3)
     np.testing.assert_array_equal(indices.astype(np.int32), expected_indices)
     print(f"PASS: {args.case}")
